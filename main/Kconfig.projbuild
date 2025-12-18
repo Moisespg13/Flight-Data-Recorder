@@ -1,0 +1,28 @@
+menu "Configuración FDR"
+
+    choice FDR_ROL
+        prompt "Rol del dispositivo"
+        default FDR_ROL_MAESTRO
+        help
+            Selecciona el rol del dispositivo en el sistema FDR.
+
+        config FDR_ROL_MAESTRO
+            bool "Maestro (Almacenamiento & Comunicación)"
+            help
+                El maestro maneja el almacenamiento (SD/eMMC), GNSS y comunicación externa.
+        
+        config FDR_ROL_ESCLAVO
+            bool "Esclavo (Adquisición)"
+            help
+                El esclavo maneja la adquisición de sensores (ADC, GPIO) y transmisión de datos al maestro.
+    endchoice
+
+    menu "Configuración SPI"
+        config FDR_SPI_HOST_ID
+            int "SPI Host ID"
+            default 2
+            help
+                SPI2_HOST (FSPI) o SPI3_HOST (HSPI).
+    endmenu
+
+endmenu

@@ -1,0 +1,22 @@
+# ESP-IDF Git Ignore List
+# Standard ESP-IDF build directory
+build/
+
+# Local configuration files
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults
+
+# VS Code files
+.vscode/
+
+# Temporary and log files
+*.log
+*.tmp
+
+# Unit testing
+test/build/
+
+# Clangd
+.clangd/
+.cache/
