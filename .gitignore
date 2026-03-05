@@ -1,20 +1,20 @@
-# ESP-IDF Git Ignore List
-# Standard ESP-IDF build directory
+# ESP-IDF Git Ignore
+# Lista de archivos que no se van a subir al repositorio
 build/
 
-# Local configuration files
+# Archivos de configuración locales
 sdkconfig
 sdkconfig.old
 sdkconfig.defaults
 
 # VS Code files
-.vscode/
+#.vscode/
 
-# Temporary and log files
+# Archivos temporales y de registro
 *.log
 *.tmp
 
-# Unit testing
+# Pruebas unitarias
 test/build/
 
 # Clangd

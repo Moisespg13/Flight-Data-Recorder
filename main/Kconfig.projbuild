@@ -1,17 +1,17 @@
 menu "Configuración FDR"
 
-    choice FDR_ROL
+    choice FDR_DEVICE_ROLE
         prompt "Rol del dispositivo"
-        default FDR_ROL_MAESTRO
+        default FDR_ROLE_MASTER
         help
             Selecciona el rol del dispositivo en el sistema FDR.
 
-        config FDR_ROL_MAESTRO
+        config FDR_ROLE_MASTER
             bool "Maestro (Almacenamiento & Comunicación)"
             help
                 El maestro maneja el almacenamiento (SD/eMMC), GNSS y comunicación externa.
         
-        config FDR_ROL_ESCLAVO
+        config FDR_ROLE_SLAVE
             bool "Esclavo (Adquisición)"
             help
                 El esclavo maneja la adquisición de sensores (ADC, GPIO) y transmisión de datos al maestro.
