@@ -20,6 +20,20 @@ El firmware está modularizado y gestionado por tareas concurrentes bajo FreeRTO
 ### Selección de Rol (Kconfig)
 Un único código fuente sirve para ambas placas. El rol se selecciona en tiempo de compilación utilizando las opciones nativas de `Kconfig` del Kernel (`CONFIG_FDR_ROLE_MASTER` o `CONFIG_FDR_ROLE_SLAVE`). El punto de entrada `app_main()` lee esta configuración y lanza la lógica correspondiente.
 
+### Tareas y Prioridades (FreeRTOS) *Contempladas hasta el momento*
+El sistema prioriza la sincronización inter-placas y la adquisición en tiempo real con la siguiente jerarquía:
+*   `tsk_coordinator` (Prio 8): Tarea efímera en el esclavo que se bloquea hasta recibir la señal `TRIG_START` (GPIO 9) desde la placa maestra para iniciar la adquisición síncrona.
+*   `tsk_acq_fast` (Prio 7): Ejecutada en el esclavo, dispara la conversión (`start_conversion`), lee datos vía SPI del AD7606 y los envía a la cola `q_fast_data` a $\sim100$ Hz.
+*   `tsk_spi_link_slave` / `tsk_spi_link_master` (Prio 6): Tareas pares en ambas placas que empaquetan, calculan sumas de comprobación (CRC32), y gestionan el intercambio de `payloads` por el bus SPI inter-placas.
+*   `tsk_data_proc` (Prio 5): Ejecutada en la maestra, recibe bloqueantemente los datos procesados y los encamina al sistema de almacenamiento/SD.
+
+### Estructura de Directorios del Código *Contemplados hasta el momento*
+*   `fdr_common`: Librería de utilidades compartidas entre maestro y esclavo (estructuras del protocolo SPI, `pin_config.h`, funciones de CRC32 vía ROM y orquestación base del bus SPI).
+*   `fast_signals`: Controlador (Driver) de la interfaz SPI para la comunicación de bajo nivel con los chips AD7606.
+*   `spi_link`: Módulo encargado del enlace bidireccional entre la MainBoard y la InputsBoard.
+*   `slave_logic`: Lógica exclusiva del co-procesador (prepara ADCs, configura interrupciones y tareas de adquisición).
+*   `master_logic`: Lógica exclusiva del procesador central (inicia colas de recepción, dispara la señal de disparo global `SYNC_TRIG` hacia el esclavo).
+
 ## Requisitos y Configuración de Desarrollo
 *   **Framework:** Espressif IoT Development Framework (ESP-IDF).
 *   **Lenguaje:** C/C++.
