@@ -38,5 +38,6 @@ typedef struct __attribute__((packed)) {
 
 // Estructuras para cargas útiles específicas
 typedef struct __attribute__((packed)) {
-  int16_t channels[16]; // 16 canales * 16 bits
+  uint64_t timestamp_ns; // Tiempo de adquisición (nanosegundos)
+  int16_t channels[16];  // 16 canales * 16 bits
 } fast_data_payload_t;

@@ -11,6 +11,7 @@
 #include "slave_logic.h"
 #include "driver/gpio.h"       // IWYU pragma: keep
 #include "esp_log.h"           // IWYU pragma: keep
+#include "esp_timer.h"         // IWYU pragma: keep
 #include "fast_signals.h"      // IWYU pragma: keep
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/queue.h"    // IWYU pragma: keep
@@ -20,6 +21,7 @@
 #include "sdkconfig.h"         // IWYU pragma: keep
 #include "spi_link.h"          // IWYU pragma: keep
 #include <string.h>            // IWYU pragma: keep
+
 
 #ifdef CONFIG_FDR_ROLE_SLAVE
 
@@ -57,6 +59,9 @@ static void tsk_acq_fast(void *pvParameters) {
       esp_err_t ret = fast_signals_read(adc1_handle, payload.channels);
 
       if (ret == ESP_OK) {
+        // Capturar tiempo exacto post-conversión (convertir a ns)
+        payload.timestamp_ns = (uint64_t)esp_timer_get_time() * 1000;
+
         if (q_fast_data) {
           // Timeout 0: Si la cola está llena, descartamos (Drop)
           xQueueSend(q_fast_data, &payload, 0);

@@ -60,7 +60,8 @@ static void tsk_spi_link_slave(void *pvParameters) {
       header->magic = FDR_PROTO_MAGIC;
       header->type = PKT_TYPE_FAST_DATA;
       header->sequence = seq++;
-      header->timestamp_ns = 0; // TODO: Sincronizar con timer local
+      header->timestamp_ns =
+          temp_payload.timestamp_ns; // Usar tiempo de adquisición
       header->length = sizeof(fast_data_payload_t);
 
       // 3. Copiar Payload al buffer de TX (después del header)
