@@ -1,0 +1,3 @@
+[submodule "FDR_Slave/lib/FreeRTOS-Kernel"]
+	path = FDR_Slave/lib/FreeRTOS-Kernel
+	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
