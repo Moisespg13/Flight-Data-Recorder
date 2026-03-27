@@ -1,0 +1,10 @@
+CompileFlags:
+  CompilationDatabase: "build"
+  Add:
+    - "-isystem"
+    - "C:/Users/yo/.pico-sdk/toolchain/14_2_Rel1/lib/gcc/arm-none-eabi/14.2.1/include"
+    - "-isystem"
+    - "C:/Users/yo/.pico-sdk/toolchain/14_2_Rel1/lib/gcc/arm-none-eabi/14.2.1/include-fixed"
+    - "-isystem"
+    - "C:/Users/yo/.pico-sdk/toolchain/14_2_Rel1/arm-none-eabi/include"
+  Remove: [-mthumb, -mcpu=cortex-m0plus]

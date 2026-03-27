@@ -1,0 +1,23 @@
+{
+    "folders": [
+        {
+            "name": "FDR [MASTER]",
+            "path": "FDR_Master"
+        },
+        {
+            "name": "FDR [SLAVE]",
+            "path": "FDR_Slave"
+        },
+        {
+            "name": "FDR [COMMON]",
+            "path": "FDR_Common"
+        }
+    ],
+    "settings": {
+        "clangd.arguments": [
+            "--query-driver=C:\\Esp32IDF\\**,c:\\Esp32IDF\\**,C:\\Users\\yo\\.pico-sdk\\**,c:\\Users\\yo\\.pico-sdk\\**",
+            "--header-insertion=never"
+        ],
+        "C_Cpp.intelliSenseEngine": "Disabled"
+    }
+}

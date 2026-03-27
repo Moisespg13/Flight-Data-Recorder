@@ -1,0 +1,7 @@
+CompileFlags:
+  CompilationDatabase: "build"
+  Remove: [-mlongcalls, -fno-shrink-wrap, -fstrict-volatile-bitfields, -fno-tree-switch-conversion, -fno-jump-tables]
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None

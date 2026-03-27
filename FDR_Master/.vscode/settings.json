@@ -1,0 +1,27 @@
+{
+    "idf.flashType": "UART",
+    "idf.portWin": "COM8",
+    "idf.currentSetup": "C:/Esp32IDF/Espressif/frameworks/esp-idf-v5.5.1/",
+    "clangd.arguments": [
+        "--query-driver=C:\\Esp32IDF\\Espressif\\tools\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
+        "--header-insertion=never"
+    ],
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "python.linting.enabled": true,
+    "python.languageServer": "Pylance",
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportMissingModuleSource": "none"
+    },
+    "python.analysis.typeshedPaths": [
+        ".vscode\\Pico-W-Stub"
+    ],
+    "python.analysis.extraPaths": [
+        ".vscode\\Pico-W-Stub"
+    ]
+}
