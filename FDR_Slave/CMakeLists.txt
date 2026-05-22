@@ -58,8 +58,12 @@ pico_sdk_init()
 add_executable(FDR_Slave
     src/main.c
     src/fast_signals.c
+    src/slow_signals.c
     src/spi_link_slave.c
 )
+
+# Generar header del programa PIO
+pico_generate_pio_header(FDR_Slave ${CMAKE_CURRENT_SOURCE_DIR}/src/spi_slave_tx.pio)
 
 # Incluir directorios de headers
 target_include_directories(FDR_Slave PRIVATE
@@ -72,6 +76,8 @@ target_link_libraries(FDR_Slave
     pico_stdlib
     hardware_spi
     hardware_gpio
+    hardware_dma
+    hardware_pio
     hardware_timer
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4

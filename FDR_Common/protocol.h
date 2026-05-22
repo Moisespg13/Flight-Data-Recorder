@@ -24,6 +24,7 @@ typedef enum {
   PKT_TYPE_FAST_DATA = 0x01, // Entradas analógicas alta velocidad
   PKT_TYPE_SLOW_DATA = 0x02, // Entradas analógicas baja velocidad
   PKT_TYPE_DISCRETE = 0x03,  // Entradas discretas (GPIO)
+  PKT_TYPE_IMU = 0x04,       // Datos IMU XSENS (12 parámetros)
   PKT_TYPE_GNSS = 0x10,      // Datos de GPS/GNSS
   PKT_TYPE_HEALTH = 0x20     // Estado del sistema
 } packet_type_t;
@@ -58,3 +59,22 @@ typedef struct __attribute__((packed)) {
   uint64_t timestamp_ns; // Tiempo de adquisición (nanosegundos)
   uint16_t states;       // 16 señales digitales (1 bit por señal)
 } discrete_payload_t;
+
+// Payload: IMU XSENS MTi-28A53G35 - 56 bytes
+// 12 parámetros float (DSP 1..12 en la especificación del CEV)
+typedef struct __attribute__((packed)) {
+  uint64_t timestamp_ns; // Tiempo de adquisición (nanosegundos)
+  float acc_x;           // DSP 1: Aceleración X (m/s²)
+  float acc_y;           // DSP 2: Aceleración Y (m/s²)
+  float acc_z;           // DSP 3: Aceleración Z (m/s²)
+  float gyr_x;           // DSP 4: Giróscopo X (rad/s)
+  float gyr_y;           // DSP 5: Giróscopo Y (rad/s)
+  float gyr_z;           // DSP 6: Giróscopo Z (rad/s)
+  float mag_x;           // DSP 7: Magnetómetro X (a.u.)
+  float mag_y;           // DSP 8: Magnetómetro Y (a.u.)
+  float mag_z;           // DSP 9: Magnetómetro Z (a.u.)
+  float roll;            // DSP 10: Ángulo de alabeo (grados)
+  float pitch;           // DSP 11: Ángulo de cabeceo (grados)
+  float yaw;             // DSP 12: Ángulo de guiñada (grados)
+} imu_payload_t;
+

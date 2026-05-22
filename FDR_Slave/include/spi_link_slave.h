@@ -3,8 +3,9 @@
  * @file spi_link_slave.h
  * @brief API del enlace SPI Slave (RP2040 -> ESP32-S3).
  *
- * Inicializa SPI1 como Slave y provee función para enviar
- * paquetes con header + payload + CRC al Maestro.
+ * Inicializa SPI1 como Slave y provee funciones para enviar
+ * paquetes de datos rápidos y lentos al Maestro, cada uno con
+ * header + payload + CRC32.
  */
 
 #pragma once
@@ -17,10 +18,15 @@
 void spi_link_slave_init(void);
 
 /**
- * @brief Envía un paquete fast_data al Maestro.
- *        Arma el paquete completo (header + payload + CRC32) y lo carga
- *        en el buffer de transmisión SPI Slave.
+ * @brief Envía un paquete de datos rápidos (PKT_TYPE_FAST_DATA) al Maestro.
  *
- * @param payload Puntero al payload de datos rápidos a enviar.
+ * @param payload Puntero al payload de datos rápidos.
  */
-void spi_link_slave_send(const fast_data_payload_t *payload);
+void spi_link_slave_send_fast(const fast_data_payload_t *payload);
+
+/**
+ * @brief Envía un paquete de datos lentos (PKT_TYPE_SLOW_DATA) al Maestro.
+ *
+ * @param payload Puntero al payload de datos lentos.
+ */
+void spi_link_slave_send_slow(const slow_data_payload_t *payload);

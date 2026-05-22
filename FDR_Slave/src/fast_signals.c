@@ -14,6 +14,9 @@
  * Cada AD7606 tiene su propio:
  *   - Chip Select (CS)
  *   - Pin BUSY
+ *
+ * El acceso al bus SPI0 se coordina con slow_signals (AD4131)
+ * mediante un mutex de FreeRTOS.
  */
 
 #include "fast_signals.h"
@@ -23,12 +26,17 @@
 #include "pin_config.h"
 #include <string.h>
 
+// Mutex compartido para SPI0
+static SemaphoreHandle_t s_spi0_mutex = NULL;
+
 // --- Tablas de pines por chip ---
 // Índice 0 = AD7606 #1, Índice 1 = AD7606 #2
 static const uint8_t cs_pins[2] = {PIN_CS_AD7606_1, PIN_CS_AD7606_2};
 static const uint8_t busy_pins[2] = {PIN_ADC_BUSY, PIN_ADC2_BUSY};
 
-void fast_signals_init(void) {
+void fast_signals_init(SemaphoreHandle_t spi0_mutex) {
+  s_spi0_mutex = spi0_mutex;
+
   // Inicializar SPI0 a 10 MHz
   spi_init(PIN_ACQ_SPI_INST, 10 * 1000 * 1000);
 
@@ -123,18 +131,29 @@ int fast_signals_read(int16_t *data_buffer) {
   // Limpiar el buffer completo (16 canales)
   memset(data_buffer, 0, FAST_SIGNALS_TOTAL_CH * sizeof(int16_t));
 
+  // Tomar el mutex SPI0
+  if (xSemaphoreTake(s_spi0_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
+    return -1; // Timeout: la tarea lenta tiene el bus
+  }
+
+  int result = 0;
+
   // Leer AD7606 #1 -> canales [0..7]
   if (read_single_chip(0, &data_buffer[0]) != 0) {
-    return -1;
+    result = -1;
   }
 
   // Leer AD7606 #2 -> canales [8..15]
-  // (Si solo hay 1 chip, este bloque no se ejecuta y los canales quedan en 0)
 #if FAST_SIGNALS_NUM_CHIPS >= 2
-  if (read_single_chip(1, &data_buffer[FAST_SIGNALS_CH_PER_CHIP]) != 0) {
-    return -1;
+  if (result == 0) {
+    if (read_single_chip(1, &data_buffer[FAST_SIGNALS_CH_PER_CHIP]) != 0) {
+      result = -1;
+    }
   }
 #endif
 
-  return 0;
+  // Liberar el mutex SPI0
+  xSemaphoreGive(s_spi0_mutex);
+
+  return result;
 }

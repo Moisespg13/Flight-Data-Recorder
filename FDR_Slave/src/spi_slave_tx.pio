@@ -1,0 +1,45 @@
+.program spi_slave_tx
+
+; PIO SPI Slave TX: envía datos por MISO sincronizado al SCK del maestro
+; IN pin 0 = SCK (GP14)
+; OUT pin 0 = MISO/TX (GP15)
+; Autopull threshold = 8 bits
+;
+; Funcionamiento: espera flanco LOW de SCK, cambia bit en MISO,
+; espera flanco HIGH de SCK (maestro samplea). Repite.
+
+.wrap_target
+  wait 0 pin 0     ; Esperar SCK LOW (cambiar dato)
+  out pins, 1      ; Poner siguiente bit en MISO
+  wait 1 pin 0     ; Esperar SCK HIGH (maestro samplea)
+.wrap
+
+% c-sdk {
+static inline void spi_slave_tx_program_init(PIO pio, uint sm, uint offset,
+                                              uint miso_pin, uint sck_pin) {
+    // Configurar MISO como output del PIO
+    pio_gpio_init(pio, miso_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, miso_pin, 1, true);  // output
+
+    // Configurar SCK como input del PIO
+    pio_gpio_init(pio, sck_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, sck_pin, 1, false);  // input
+
+    pio_sm_config c = spi_slave_tx_program_get_default_config(offset);
+
+    // OUT pin = MISO
+    sm_config_set_out_pins(&c, miso_pin, 1);
+
+    // IN pin base = SCK (para las instrucciones wait)
+    sm_config_set_in_pins(&c, sck_pin);
+
+    // Autopull cada 8 bits, shift MSB first
+    sm_config_set_out_shift(&c, false, true, 8);  // MSB first, autopull, 8 bits
+
+    // Clock divider = 1 (máxima velocidad para seguir al maestro)
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
