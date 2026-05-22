@@ -248,13 +248,13 @@ python fdr_converter.py
          RP2040 (Esclavo)                         ESP32-S3 (Maestro)
 ┌─────────────────────────┐              ┌──────────────────────────────────┐
 │                         │              │                                  │
-│ AD7606 ×2 ──► acq_fast ─┤              │  GPS ──UART──► gnss ──────────┐ │
-│ (16 ch, 3kHz)           │              │  IMU ──UART──► imu_xsens ───┐ │ │
-│                         │              │  16 GPIO ────► discrete ──┐  │ │ │
-│ AD4131 ────► acq_slow ──┤   SPI+DRDY   │                          │  │ │ │
-│ (16 ch, 150Hz)          ├─────────────►│  spi_link ──► data_proc ──┤  │ │ │
-│                         │              │              slow_proc ──┤  │ │ │
-│ PPS ───────► time_sync  │              │                          ▼  ▼ ▼ │
+│ AD7606 ×2 ──► acq_fast ─┤              │  GPS ──UART──► gnss ──────────┐  │
+│ (16 ch, 3kHz)           │              │  IMU ──UART──► imu_xsens ───┐ │  │
+│                         │              │  16 GPIO ────► discrete ──┐ │ │  │
+│ AD4131 ────► acq_slow ──┤   SPI+DRDY   │                          │  │ │  │
+│ (16 ch, 150Hz)          ├─────────────►│  spi_link ──► data_proc──┤  │ │  │
+│                         │              │              slow_proc ──┤  │ │  │
+│ PPS ───────► time_sync  │              │                          ▼  ▼ ▼  │
 │ (< 4µs drift)           │              │              ┌──────────────────┐│
 │                         │              │              │ sample_format    ││
 │ SYNC_TRIG ─► coordinator│              │              │ (ensamblador CEV)││
