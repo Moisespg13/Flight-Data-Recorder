@@ -30,6 +30,7 @@
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "pico/stdlib.h"
+#include "pico/time.h"
 
 // FreeRTOS
 #include "FreeRTOS.h"
@@ -57,14 +58,22 @@ static QueueHandle_t q_slow_data = NULL;
 static SemaphoreHandle_t spi0_mutex = NULL;
 
 // Handles de las tareas (para que el coordinator las despierte)
+static TaskHandle_t h_tsk_coordinator = NULL;
 static TaskHandle_t h_tsk_acq_fast = NULL;
 static TaskHandle_t h_tsk_acq_slow = NULL;
 static TaskHandle_t h_tsk_spi_link = NULL;
 static TaskHandle_t h_tsk_time_sync = NULL;
 
 // Profundidad de las colas
-#define FAST_DATA_QUEUE_DEPTH 4
+#define FAST_DATA_QUEUE_DEPTH 64
 #define SLOW_DATA_QUEUE_DEPTH 2
+
+// Período del timer de muestreo rápido (µs)
+// 333 µs ≈ 3003 Hz (el entero más cercano a 3000 Hz)
+#define FAST_SAMPLE_PERIOD_US 333
+
+// Contador de drops (muestras descartadas por cola llena)
+static volatile uint32_t s_fast_drops = 0;
 
 // ============================================================================
 // Reloj Disciplinado por PPS
@@ -102,11 +111,52 @@ static inline uint64_t get_calibrated_timestamp_ns(void) {
 }
 
 // ============================================================================
+// ISR: Timer de muestreo rápido (cada 333 µs → ~3003 Hz)
+// ============================================================================
+static repeating_timer_t s_fast_timer;
+
+static bool fast_timer_callback(repeating_timer_t *rt) {
+  (void)rt;
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveIndexedFromISR(h_tsk_acq_fast, 1, &xHigherPriorityTaskWoken);
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  return true; // Seguir repitiendo
+}
+
+// ============================================================================
+// ISR: Callback compartido para GPIO (PPS + SYNC_TRIG)
+// ============================================================================
+// El SDK del RP2040 permite un solo callback GPIO por core. Este callback
+// despacha por número de pin.
+static volatile uint64_t s_pps_edge_us = 0;
+
+static void shared_gpio_callback(uint gpio, uint32_t events) {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+  if (gpio == PIN_SYNC_TRIG && (events & GPIO_IRQ_EDGE_RISE)) {
+    if (h_tsk_coordinator != NULL) {
+      vTaskNotifyGiveFromISR(h_tsk_coordinator, &xHigherPriorityTaskWoken);
+    }
+  }
+
+  if (gpio == PIN_PPS && (events & GPIO_IRQ_EDGE_RISE)) {
+    s_pps_edge_us = time_us_64(); // Captura con < 1 µs de jitter
+    if (h_tsk_time_sync != NULL) {
+      vTaskNotifyGiveIndexedFromISR(h_tsk_time_sync, 1,
+                                    &xHigherPriorityTaskWoken);
+    }
+  }
+
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// ============================================================================
 // Tarea: Coordinador (Prioridad 8 - MÁXIMA)
 // ============================================================================
 /**
  * @brief Primera tarea en arrancar. Espera la señal SYNC_TRIG del Maestro.
  *
+ * Usa interrupción GPIO para detección inmediata (sin polling).
  * Cuando recibe la señal:
  *   1. Despierta a todas las tareas de trabajo.
  *   2. Se autodestruye (libera su stack y deja de consumir recursos).
@@ -114,21 +164,23 @@ static inline uint64_t get_calibrated_timestamp_ns(void) {
 static void tsk_coordinator_slave(void *pvParameters) {
   (void)pvParameters;
 
-  // Configura pin SYNC_TRIG como entrada con pull-down
-  gpio_init(PIN_SYNC_TRIG);
-  gpio_set_dir(PIN_SYNC_TRIG, GPIO_IN);
-  gpio_pull_down(PIN_SYNC_TRIG);
-
-  printf("[COORD] Esperando SYNC_TRIG en GP%d...\n", PIN_SYNC_TRIG);
-
-  // Espera a que el Maestro ponga SYNC_TRIG en alto
-  while (gpio_get(PIN_SYNC_TRIG) == 0) {
-    vTaskDelay(pdMS_TO_TICKS(10));
+  // GPIO ya configurado en main(). Verificar si SYNC_TRIG ya está en HIGH.
+  if (gpio_get(PIN_SYNC_TRIG) == 0) {
+    printf("[COORD] Esperando SYNC_TRIG en GP%d (por interrupción)...\n",
+           PIN_SYNC_TRIG);
+    // Bloquearse hasta que la ISR de SYNC_TRIG notifique (index 0)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  } else {
+    printf("[COORD] SYNC_TRIG ya estaba en HIGH al arrancar.\n");
   }
 
   printf("[COORD] *** SYNC recibido! Despertando tareas... ***\n");
 
-  // Despierta a todas las tareas bloqueadas (Task Notification)
+  // Deshabilitar IRQ de SYNC_TRIG (ya no la necesitamos)
+  gpio_set_irq_enabled(PIN_SYNC_TRIG, GPIO_IRQ_EDGE_RISE, false);
+  h_tsk_coordinator = NULL; // Prevenir que la ISR notifique a tarea eliminada
+
+  // Despierta a todas las tareas bloqueadas (Task Notification, index 0)
   xTaskNotifyGive(h_tsk_acq_fast);
   xTaskNotifyGive(h_tsk_acq_slow);
   xTaskNotifyGive(h_tsk_spi_link);
@@ -146,20 +198,36 @@ static void tsk_coordinator_slave(void *pvParameters) {
 /**
  * @brief Lee datos de los ADCs (AD7606) y los deposita en q_fast_data.
  *        Arranca bloqueada hasta que el coordinator la despierte.
+ *
+ * Usa un timer de hardware (repeating_timer) para muestrear a ~3003 Hz.
+ * El timer notifica la tarea vía Task Notification (index 1).
  */
 static void tsk_acq_fast_slave(void *pvParameters) {
   (void)pvParameters;
 
-  // Bloquearse hasta que el coordinator nos despierte
+  // Bloquearse hasta que el coordinator nos despierte (index 0)
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-  printf("[ACQ_FAST] *** Arrancando adquisición a %d canales. ***\n",
+  printf("[ACQ_FAST] *** Arrancando adquisición a %d canales a ~3 kHz. ***\n",
          FAST_SIGNALS_TOTAL_CH);
 
+  // Iniciar timer de hardware para muestreo a 3 kHz
+  // Valor negativo = intervalo exacto desde inicio (no desde fin)
+  if (!add_repeating_timer_us(-FAST_SAMPLE_PERIOD_US, fast_timer_callback,
+                               NULL, &s_fast_timer)) {
+    printf("[ACQ_FAST] *** ERROR: No se pudo crear timer! ***\n");
+    vTaskDelete(NULL);
+    return;
+  }
+  printf("[ACQ_FAST] Timer de muestreo iniciado (período=%d µs).\n",
+         FAST_SAMPLE_PERIOD_US);
+
   fast_data_payload_t payload;
-  TickType_t xLastWakeTime = xTaskGetTickCount();
 
   while (true) {
+    // Bloquearse hasta que el timer ISR notifique (index 1)
+    ulTaskNotifyTakeIndexed(1, pdTRUE, portMAX_DELAY);
+
     memset(&payload, 0, sizeof(payload));
 
     // Iniciar conversión (no necesita el bus SPI, solo pulsa CONVST)
@@ -171,13 +239,13 @@ static void tsk_acq_fast_slave(void *pvParameters) {
 
       // Enviar a la cola (sin esperar si está llena, descarta)
       if (xQueueSend(q_fast_data, &payload, 0) != pdPASS) {
-        // TODO: Contar drops en producción.
+        s_fast_drops++;
+        if (s_fast_drops % 1000 == 0) {
+          printf("[ACQ_FAST] WARN: %lu drops acumulados.\n",
+                 (unsigned long)s_fast_drops);
+        }
       }
     }
-
-    // Período de muestreo (~100 Hz por ahora)
-    // TODO: Ajustar a 3000 SPS cuando el hardware esté calibrado
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
   }
 }
 
@@ -227,8 +295,9 @@ static void tsk_acq_slow_slave(void *pvParameters) {
  * @brief Recibe datos de q_fast_data y q_slow_data y los transmite.
  *        Arranca bloqueada hasta que el coordinator la despierte.
  *
- * Prioriza los datos rápidos: primero intenta vaciar q_fast_data,
- * luego revisa q_slow_data si no hay datos rápidos pendientes.
+ * Optimizada para 3 kHz: drena TODOS los paquetes rápidos pendientes
+ * antes de revisar los lentos. Bloquea en la cola rápida cuando no
+ * hay datos, eliminando el delay fijo de 1 ms.
  */
 static void tsk_spi_link_slave(void *pvParameters) {
   (void)pvParameters;
@@ -236,29 +305,26 @@ static void tsk_spi_link_slave(void *pvParameters) {
   // Bloquearse hasta que el coordinator nos despierte
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-  printf("[SPI_LINK] Tarea de transmisión activa. Esperando datos...\n");
+  printf("[SPI_LINK] Tarea de transmisión activa (optimizada para 3 kHz).\n");
 
   fast_data_payload_t fast_payload;
   slow_data_payload_t slow_payload;
 
   while (true) {
-    bool sent_something = false;
-
-    // 1. Intentar datos rápidos (sin espera bloqueante)
-    if (xQueueReceive(q_fast_data, &fast_payload, 0) == pdPASS) {
+    // 1. Drenar TODOS los datos rápidos pendientes (prioridad máxima)
+    while (xQueueReceive(q_fast_data, &fast_payload, 0) == pdPASS) {
       spi_link_slave_send_fast(&fast_payload);
-      sent_something = true;
     }
 
-    // 2. Intentar datos lentos (siempre se revisa, evita starvation)
+    // 2. Revisar datos lentos (uno por iteración, evita starvation)
     if (xQueueReceive(q_slow_data, &slow_payload, 0) == pdPASS) {
       spi_link_slave_send_slow(&slow_payload);
-      sent_something = true;
-    }
-
-    // 3. Si no había nada, dormir 1ms para no quemar CPU
-    if (!sent_something) {
-      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      // 3. Nada pendiente → bloquear en cola rápida (ahorra CPU)
+      if (xQueueReceive(q_fast_data, &fast_payload, pdMS_TO_TICKS(5))
+          == pdPASS) {
+        spi_link_slave_send_fast(&fast_payload);
+      }
     }
   }
 }
@@ -270,71 +336,56 @@ static void tsk_spi_link_slave(void *pvParameters) {
  * @brief Recalibra el timestamp local usando el pulso PPS del Maestro.
  *        Arranca bloqueada hasta que el coordinator la despierte.
  *
- * Por ahora, simplemente detecta los flancos del PPS y logea
- * la diferencia para calibración futura (FR-T1, FR-T3).
- *
- * TODO: Implementar disciplining real del reloj (ajuste de offset/drift).
+ * Usa interrupción GPIO para capturar el flanco PPS con < 1 µs de jitter.
+ * La ISR captura time_us_64() y notifica esta tarea (index 1).
+ * La tarea procesa el timestamp y corrige el drift del oscilador.
  */
 static void tsk_time_sync_slave(void *pvParameters) {
   (void)pvParameters;
 
-  // Bloquearse hasta que el coordinator nos despierte
+  // Bloquearse hasta que el coordinator nos despierte (index 0)
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-  // Configurar pin PPS como entrada
-  gpio_init(PIN_PPS);
-  gpio_set_dir(PIN_PPS, GPIO_IN);
-  gpio_pull_down(PIN_PPS);
+  // GPIO ya configurado en main(). Limpiar notificaciones PPS espurias
+  // que pudieran haberse acumulado antes del arranque.
+  ulTaskNotifyTakeIndexed(1, pdTRUE, 0); // Non-blocking, limpia index 1
 
-  printf("[TIME_SYNC] Reloj disciplinado por PPS activo en GP%d.\n", PIN_PPS);
+  printf("[TIME_SYNC] Reloj disciplinado por PPS (interrupción) en GP%d.\n",
+         PIN_PPS);
 
-  bool prev_pps = false;
-  uint64_t last_pps_local_us = 0;  // time_us_64() en el PPS anterior
-  uint32_t pps_count = 0;          // Contador de pulsos recibidos
+  uint64_t last_pps_us = 0;  // Timestamp del PPS anterior (capturado por ISR)
+  uint32_t pps_count = 0;
 
   while (true) {
-    bool current_pps = gpio_get(PIN_PPS);
+    // Bloquearse hasta que la ISR de PPS notifique (index 1)
+    ulTaskNotifyTakeIndexed(1, pdTRUE, portMAX_DELAY);
 
-    // Detectar flanco ascendente del PPS
-    if (current_pps && !prev_pps) {
-      uint64_t now_local_us = time_us_64();
-      pps_count++;
+    // Leer el timestamp capturado por la ISR (< 1 µs de jitter)
+    uint64_t edge_us = s_pps_edge_us;
+    pps_count++;
 
-      if (last_pps_local_us > 0) {
-        // Tiempo local transcurrido entre dos PPS consecutivos
-        uint64_t delta_local_us = now_local_us - last_pps_local_us;
+    if (last_pps_us > 0) {
+      // Tiempo local transcurrido entre dos PPS consecutivos
+      uint64_t delta_local_us = edge_us - last_pps_us;
 
-        // El período real es exactamente 1,000,000 µs (1 segundo GPS).
-        // La diferencia es el error acumulado del oscilador local.
-        int32_t error_us = (int32_t)(delta_local_us - 1000000);
+      // El período real es exactamente 1,000,000 µs (1 segundo GPS).
+      int32_t error_us = (int32_t)(delta_local_us - 1000000);
 
-        // Corregir el offset: si el reloj local es rápido (+error),
-        // restamos; si es lento (-error), sumamos.
-        s_pps_offset_us -= error_us;
-        s_pps_calibrated = true;
+      // Corregir el offset
+      s_pps_offset_us -= error_us;
+      s_pps_calibrated = true;
 
-        // Log cada 10 segundos (no spamear)
-        if ((pps_count % 10) == 0) {
-          printf("[TIME_SYNC] PPS #%lu | drift=%ld us | offset=%lld us\n",
-                 (unsigned long)pps_count, (long)error_us,
-                 (long long)s_pps_offset_us);
-        }
-      } else {
-        // Primer PPS: solo registrar el instante, no podemos calcular drift
-        printf("[TIME_SYNC] Primer PPS recibido. Calibrando...\n");
+      // Log cada 10 segundos
+      if ((pps_count % 10) == 0) {
+        printf("[TIME_SYNC] PPS #%lu | drift=%ld us | offset=%lld us\n",
+               (unsigned long)pps_count, (long)error_us,
+               (long long)s_pps_offset_us);
       }
-
-      last_pps_local_us = now_local_us;
+    } else {
+      printf("[TIME_SYNC] Primer PPS recibido. Calibrando...\n");
     }
 
-    prev_pps = current_pps;
-
-    // Polling a 1 kHz
-    // NOTA: El jitter del polling (~1ms) NO afecta la precisión a largo
-    // plazo porque el offset se acumula correctamente. Solo afecta la
-    // latencia de detección del flanco. Para <1µs de jitter, migrar
-    // a interrupción GPIO (mejora futura con PIO).
-    vTaskDelay(pdMS_TO_TICKS(1));
+    last_pps_us = edge_us;
   }
 }
 
@@ -413,6 +464,23 @@ int main(void) {
   printf("[MAIN] Colas creadas (fast:%d, slow:%d).\n", FAST_DATA_QUEUE_DEPTH,
          SLOW_DATA_QUEUE_DEPTH);
 
+  // 5.5 Configurar interrupciones GPIO para SYNC_TRIG y PPS
+  //     (debe hacerse desde core 0 antes del scheduler para SMP)
+  gpio_init(PIN_SYNC_TRIG);
+  gpio_set_dir(PIN_SYNC_TRIG, GPIO_IN);
+  gpio_pull_down(PIN_SYNC_TRIG);
+
+  gpio_init(PIN_PPS);
+  gpio_set_dir(PIN_PPS, GPIO_IN);
+  gpio_pull_down(PIN_PPS);
+
+  // Registrar callback compartido y habilitar interrupciones
+  gpio_set_irq_enabled_with_callback(PIN_SYNC_TRIG, GPIO_IRQ_EDGE_RISE, true,
+                                      shared_gpio_callback);
+  gpio_set_irq_enabled(PIN_PPS, GPIO_IRQ_EDGE_RISE, true);
+  printf("[MAIN] Interrupciones GPIO configuradas (SYNC=GP%d, PPS=GP%d).\n",
+         PIN_SYNC_TRIG, PIN_PPS);
+
   // 6. Crear tareas de trabajo (arrancan bloqueadas esperando al coordinator)
   xTaskCreate(tsk_acq_fast_slave, "acq_fast", 1024, NULL, 7, &h_tsk_acq_fast);
 
@@ -422,8 +490,9 @@ int main(void) {
 
   xTaskCreate(tsk_time_sync_slave, "time_sync", 768, NULL, 6, &h_tsk_time_sync);
 
-  // Coordinator: prioridad máxima (8), se crea última
-  xTaskCreate(tsk_coordinator_slave, "coordinator", 768, NULL, 8, NULL);
+  // Coordinator: prioridad máxima (8), guarda handle para la ISR
+  xTaskCreate(tsk_coordinator_slave, "coordinator", 768, NULL, 8,
+              &h_tsk_coordinator);
 
   printf("[MAIN] 5 tareas creadas. Arrancando scheduler de FreeRTOS...\n");
 

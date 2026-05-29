@@ -450,7 +450,7 @@ esp_err_t master_logic_start(void) {
   }
 
   // 6. Crear Colas de recepción SPI (datos del Esclavo)
-  q_rx_fast = xQueueCreate(50, sizeof(fast_data_payload_t));
+  q_rx_fast = xQueueCreate(200, sizeof(fast_data_payload_t));
   q_rx_slow = xQueueCreate(10, sizeof(slow_data_payload_t));
   if (q_rx_fast == NULL || q_rx_slow == NULL) {
     ESP_LOGE(TAG, "Error al crear colas rx_data");

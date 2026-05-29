@@ -38,6 +38,14 @@ static QueueHandle_t s_slow_queue = NULL;
 
 DMA_ATTR static uint8_t rx_buffer[SPI_RX_BUF_SIZE];
 
+static SemaphoreHandle_t s_drdy_sem = NULL;
+
+static void IRAM_ATTR drdy_isr(void *arg) {
+  BaseType_t woken = pdFALSE;
+  xSemaphoreGiveFromISR(s_drdy_sem, &woken);
+  if (woken) portYIELD_FROM_ISR();
+}
+
 static void tsk_spi_link_master(void *pvParameters) {
   ESP_LOGI(TAG, "Tarea SPI Link Maestro Iniciada");
 
@@ -48,15 +56,23 @@ static void tsk_spi_link_master(void *pvParameters) {
     return;
   }
 
+  s_drdy_sem = xSemaphoreCreateBinary();
+
   // Configurar GPIO DRDY como entrada
   gpio_config_t io_conf = {
       .pin_bit_mask = (1ULL << PIN_SPI_DRDY),
       .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
       .pull_down_en = GPIO_PULLDOWN_ENABLE, // Pull-down: LOW cuando no hay señal
-      .intr_type = GPIO_INTR_DISABLE,
+      .intr_type = GPIO_INTR_POSEDGE,
   };
   gpio_config(&io_conf);
+
+  esp_err_t ret_isr = gpio_install_isr_service(0);
+  if (ret_isr != ESP_OK && ret_isr != ESP_ERR_INVALID_STATE) {
+      ESP_LOGE(TAG, "Failed to install ISR service: %s", esp_err_to_name(ret_isr));
+  }
+  gpio_isr_handler_add(PIN_SPI_DRDY, drdy_isr, NULL);
 
   ESP_LOGI(TAG, "MAX_PKT_LEN=%d, SPI_RX_BUF_SIZE=%d, DRDY=GPIO%d",
            (int)MAX_PKT_LEN, (int)SPI_RX_BUF_SIZE, PIN_SPI_DRDY);
@@ -66,22 +82,11 @@ static void tsk_spi_link_master(void *pvParameters) {
   uint32_t fail_count = 0;
   uint32_t drdy_hits = 0;
 
-  uint32_t drdy_wait = 0;
-  const uint32_t DRDY_TIMEOUT = 500; // Máximo 500 ticks (~500ms) esperando DRDY
-
   while (1) {
-    // Esperar a que el Esclavo aserte DRDY (con timeout)
-    if (gpio_get_level(PIN_SPI_DRDY) == 0) {
-      drdy_wait++;
-      if (drdy_wait < DRDY_TIMEOUT) {
-        vTaskDelay(1); // No hay dato listo, ceder CPU
-        continue;
-      }
+    // Esperar a que el Esclavo aserte DRDY (timeout 500ms)
+    if (xSemaphoreTake(s_drdy_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
       // Timeout: leer de todas formas (fallback a polling ciego)
       // Esto permite funcionar aunque el cable DRDY no esté conectado
-      drdy_wait = 0;
-    } else {
-      drdy_wait = 0;
     }
 
     // DRDY HIGH o timeout → leer SPI
