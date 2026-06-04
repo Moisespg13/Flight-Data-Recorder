@@ -74,6 +74,7 @@ static TaskHandle_t h_tsk_time_sync = NULL;
 
 // Contador de drops (muestras descartadas por cola llena)
 static volatile uint32_t s_fast_drops = 0;
+static volatile uint32_t s_slow_drops = 0;
 
 // ============================================================================
 // Reloj Disciplinado por PPS
@@ -279,7 +280,10 @@ static void tsk_acq_slow_slave(void *pvParameters) {
 
       // Enviar a la cola
       if (xQueueSend(q_slow_data, &payload, 0) != pdPASS) {
-        // TODO: Contar drops.
+        s_slow_drops++;
+        if (s_slow_drops % 100 == 0) {
+          printf("[ACQ_SLOW] WARN: %lu drops acumulados.\n", (unsigned long)s_slow_drops);
+        }
       }
     }
 

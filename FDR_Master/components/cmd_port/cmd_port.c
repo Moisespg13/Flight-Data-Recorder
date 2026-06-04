@@ -20,11 +20,15 @@
 
 #include "cmd_port.h"
 #include "pin_config.h"
+#include "sd_storage.h"
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <string.h>
 
@@ -162,6 +166,38 @@ static void handle_read_format(void) {
 }
 
 /**
+ * @brief Ejecuta CMD 4: Formatear MicroSD.
+ *
+ * Requiere que el campo 'data' contenga la clave de seguridad
+ * CMD_FORMAT_KEY (0x55AA) para prevenir formateos accidentales.
+ */
+static void handle_format_sd(uint16_t key) {
+  if (key != CMD_FORMAT_KEY) {
+    ESP_LOGW(TAG, "CMD4: Clave de formateo incorrecta: 0x%04X (esperado 0x%04X)",
+             key, CMD_FORMAT_KEY);
+    send_response(CMD_FORMAT_SD, CMD_ACK_ERROR);
+    return;
+  }
+
+  ESP_LOGW(TAG, "CMD4: Comando de formateo recibido con clave correcta");
+
+  esp_err_t ret = sd_storage_format();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "CMD4: Error al formatear MicroSD");
+    send_response(CMD_FORMAT_SD, CMD_ACK_ERROR);
+    return;
+  }
+
+  ESP_LOGI(TAG, "CMD4: MicroSD formateada exitosamente");
+  send_response(CMD_FORMAT_SD, CMD_ACK_OK);
+
+  // Reiniciar la placa para arrancar con la memoria limpia y estado consistente
+  ESP_LOGW(TAG, "CMD4: Reiniciando el sistema en 2 segundos...");
+  vTaskDelay(pdMS_TO_TICKS(2000));
+  esp_restart();
+}
+
+/**
  * @brief Procesa un mensaje completo recibido.
  */
 static void process_message(const cmd_message_t *msg) {
@@ -184,6 +220,9 @@ static void process_message(const cmd_message_t *msg) {
   case CMD_READ_FORMAT:
     handle_read_format();
     break;
+  case CMD_FORMAT_SD:
+    handle_format_sd(msg->data);
+    break;
   default:
     ESP_LOGW(TAG, "Comando desconocido: 0x%04X", msg->command);
     send_response(msg->command, CMD_ACK_ERROR);
@@ -196,11 +235,14 @@ static void process_message(const cmd_message_t *msg) {
 // ============================================================================
 
 esp_err_t cmd_port_init(void) {
+  // Para TB4 compartimos el UART0 (Consola). Usamos 115200 baudios en lugar de 9600.
+  int baud_rate = (CMD_UART_NUM == 0) ? 115200 : CMD_BAUD_RATE;
+
   ESP_LOGI(TAG, "Inicializando Puerto de Comandos (UART%d, %d baud)...",
-           CMD_UART_NUM, CMD_BAUD_RATE);
+           CMD_UART_NUM, baud_rate);
 
   uart_config_t uart_config = {
-      .baud_rate = CMD_BAUD_RATE,
+      .baud_rate = baud_rate,
       .data_bits = UART_DATA_8_BITS,
       .parity = UART_PARITY_DISABLE,
       .stop_bits = UART_STOP_BITS_1,
@@ -211,27 +253,29 @@ esp_err_t cmd_port_init(void) {
   esp_err_t ret = uart_param_config(CMD_UART_NUM, &uart_config);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Error al configurar UART: %s", esp_err_to_name(ret));
-    return ret;
+    // No abortamos, seguimos intentando
   }
 
-  ret = uart_set_pin(CMD_UART_NUM, PIN_CMD_TX, PIN_CMD_RX,
-                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Error al asignar pines UART: %s", esp_err_to_name(ret));
-    return ret;
+  // Set pin
+  if (PIN_CMD_TX != UART_PIN_NO_CHANGE || PIN_CMD_RX != UART_PIN_NO_CHANGE) {
+    ret = uart_set_pin(CMD_UART_NUM, PIN_CMD_TX, PIN_CMD_RX,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Error al asignar pines UART: %s", esp_err_to_name(ret));
+    }
   }
 
   ret = uart_driver_install(CMD_UART_NUM, CMD_BUF_SIZE * 2, CMD_BUF_SIZE, 0,
                             NULL, 0);
-  if (ret != ESP_OK) {
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    // ESP_ERR_INVALID_STATE significa que ya estaba instalado (ej. consola)
     ESP_LOGE(TAG, "Error al instalar driver UART: %s", esp_err_to_name(ret));
     return ret;
   }
 
   s_rx_pos = 0;
 
-  ESP_LOGI(TAG, "Puerto de Comandos listo en UART%d (RX=GPIO%d, TX=GPIO%d)",
-           CMD_UART_NUM, PIN_CMD_RX, PIN_CMD_TX);
+  ESP_LOGI(TAG, "Puerto de Comandos listo en UART%d", CMD_UART_NUM);
   return ESP_OK;
 }
 

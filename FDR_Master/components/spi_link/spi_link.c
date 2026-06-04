@@ -19,6 +19,7 @@
 #include "pin_config.h"
 #include "protocol.h"
 #include "spi_manager.h"
+#include "supervisor.h"
 #include <string.h>
 
 static const char *TAG = "SPI_LINK";
@@ -82,6 +83,9 @@ static void tsk_spi_link_master(void *pvParameters) {
   uint32_t fail_count = 0;
   uint32_t drdy_hits = 0;
 
+  // Registrar en el supervisor (timeout 5 segundos)
+  supervisor_register(TASK_ID_SPI_LINK, "spi_link", 5000);
+
   while (1) {
     // Esperar a que el Esclavo aserte DRDY (timeout 500ms)
     if (xSemaphoreTake(s_drdy_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
@@ -124,6 +128,7 @@ static void tsk_spi_link_master(void *pvParameters) {
       // ¡Paquete válido!
       const uint8_t *payload_ptr = &rx_buffer[i + sizeof(fdr_header_t)];
       ok_count++;
+      supervisor_checkin(TASK_ID_SPI_LINK);
 
       if (ok_count % 50 == 0) {
         ESP_LOGI(TAG, "PKT OK #%lu type=0x%02X seq=%u idx=%d (drdy=%lu)",

@@ -69,3 +69,27 @@ esp_err_t sd_storage_flush(void);
  * asegurar la integridad del sistema de archivos FAT.
  */
 void sd_storage_close(void);
+
+/**
+ * @brief Verifica el espacio libre en la MicroSD y libera si es necesario.
+ *
+ * Consulta el espacio libre mediante esp_vfs_fat_info(). Si es menor
+ * al umbral definido (1 GB), borra secuencialmente los archivos
+ * FDR_XXXX.bin más antiguos hasta alcanzar el espacio requerido.
+ * Utiliza detección de wrap-around para mantener el orden cronológico.
+ *
+ * Debe llamarse ANTES de abrir un nuevo archivo de vuelo.
+ *
+ * @return ESP_OK si hay espacio suficiente (o se liberó con éxito).
+ */
+esp_err_t sd_storage_ensure_free_space(void);
+
+/**
+ * @brief Formatea la MicroSD completa (borra todos los archivos).
+ *
+ * Cierra cualquier archivo de vuelo abierto y ejecuta un formateo
+ * FAT32 de la tarjeta. La tarjeta debe estar montada.
+ *
+ * @return ESP_OK si el formateo fue exitoso.
+ */
+esp_err_t sd_storage_format(void);

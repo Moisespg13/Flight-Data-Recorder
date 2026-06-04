@@ -13,6 +13,7 @@
  *   CMD 1: Lectura en tiempo real de un parámetro analógico.
  *   CMD 2: Escritura del formato de muestreo en memoria no volátil.
  *   CMD 3: Lectura del formato de muestreo almacenado.
+ *   CMD 4: Formatear MicroSD (requiere clave de confirmación 0x55AA).
  *
  * Conexión física:
  *   Notebook → Cable RS-232 → MAX3232E → ESP32 UART1 (GPIO41/42)
@@ -30,6 +31,10 @@
 #define CMD_READ_PARAM   0x0001  // Lectura de parámetro en tiempo real
 #define CMD_WRITE_FORMAT 0x0002  // Escritura de formato de muestreo a NVS
 #define CMD_READ_FORMAT  0x0003  // Lectura de formato de muestreo desde NVS
+#define CMD_FORMAT_SD    0x0004  // Formatear MicroSD completa
+
+// Clave de seguridad para el comando de formateo
+#define CMD_FORMAT_KEY   0x55AA
 
 // Códigos de respuesta
 #define CMD_ACK_OK       0x0001  // Confirmación exitosa
