@@ -36,9 +36,12 @@ typedef struct {
  * @brief Datos de posición extraídos del GNSS.
  */
 typedef struct {
-  double latitude;  // Grados decimales (negativo = Sur)
-  double longitude; // Grados decimales (negativo = Oeste)
+  double latitude;    // Grados decimales (negativo = Sur)
+  double longitude;   // Grados decimales (negativo = Oeste)
   float speed_knots;
+  float altitude_m;   // Altitud MSL en metros (de $GPGGA)
+  float hdop;         // Dilución horizontal de precisión
+  uint8_t satellites; // Cantidad de satélites en uso
   bool valid;
 } gnss_position_t;
 

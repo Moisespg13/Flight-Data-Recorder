@@ -216,6 +216,13 @@ static void tsk_time_sync_master(void *pvParameters) {
                                 gtime.hour, gtime.minute, gtime.second);
     }
 
+    // Actualizar posición GPS (Lat/Lon/Alt) para formatos CEV 2 y 3
+    gnss_position_t pos;
+    gnss_get_position(&pos);
+    if (pos.valid) {
+      sample_format_update_gnss(pos.latitude, pos.longitude, pos.altitude_m);
+    }
+
     // Actualizar DSP 12 (señal de sincronismo = estado PPS)
     sample_format_update_dsp12(gnss_pps_is_active() ? 1 : 0);
 

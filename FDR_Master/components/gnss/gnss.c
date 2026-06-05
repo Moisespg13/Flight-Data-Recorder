@@ -10,6 +10,8 @@
  * Tramas NMEA parseadas:
  *   - $GPRMC / $GNRMC: Hora UTC, fecha, posición, velocidad, validez.
  *     Formato: $GPRMC,hhmmss.ss,A,llll.ll,N,yyyyy.yy,W,spd,crs,ddmmyy,...*hh
+ *   - $GPGGA / $GNGGA: Altitud MSL, satélites en uso, HDOP.
+ *     Formato: $GPGGA,hhmmss.ss,llll.ll,N,yyyyy.yy,W,q,nn,hdop,alt,M,...*hh
  *
  * Estrategia de sincronización:
  *   El PPS marca el borde exacto de cada segundo UTC. La trama NMEA
@@ -249,14 +251,72 @@ static void parse_rmc(char *sentence) {
 }
 
 /**
+ * @brief Parsea una trama $GPGGA o $GNGGA.
+ *
+ * Campos del $GPGGA:
+ *   0: $GPGGA    (identificador)
+ *   1: hhmmss.ss (hora UTC — ya la tomamos del RMC, ignoramos acá)
+ *   2: llll.ll   (latitud — ya la tomamos del RMC)
+ *   3: N/S
+ *   4: yyyyy.yy  (longitud — ya la tomamos del RMC)
+ *   5: E/W
+ *   6: quality   (0=sin fix, 1=GPS, 2=DGPS, etc.)
+ *   7: nn        (cantidad de satélites en uso)
+ *   8: hdop      (dilución horizontal de precisión)
+ *   9: alt       (altitud sobre el nivel del mar, en metros)
+ *  10: M         (unidad de altitud, siempre 'M')
+ */
+static void parse_gga(char *sentence) {
+  char copy[256];
+
+  // Campo 6: Calidad del fix (0 = sin fix)
+  strncpy(copy, sentence, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  char *quality_str = nmea_get_field(copy, 6);
+  if (quality_str == NULL || *quality_str == '0') {
+    return; // Sin fix, descartar
+  }
+
+  // Campo 7: Número de satélites
+  strncpy(copy, sentence, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  char *sat_str = nmea_get_field(copy, 7);
+  if (sat_str != NULL && sat_str[0] != '\0') {
+    s_position.satellites = (uint8_t)atoi(sat_str);
+  }
+
+  // Campo 8: HDOP
+  strncpy(copy, sentence, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  char *hdop_str = nmea_get_field(copy, 8);
+  if (hdop_str != NULL && hdop_str[0] != '\0') {
+    s_position.hdop = (float)atof(hdop_str);
+  }
+
+  // Campo 9: Altitud MSL (metros)
+  strncpy(copy, sentence, sizeof(copy) - 1);
+  copy[sizeof(copy) - 1] = '\0';
+  char *alt_str = nmea_get_field(copy, 9);
+  if (alt_str != NULL && alt_str[0] != '\0') {
+    s_position.altitude_m = (float)atof(alt_str);
+  }
+
+  ESP_LOGD(TAG, "GGA: sats=%u hdop=%.1f alt=%.1fm",
+           s_position.satellites, s_position.hdop, s_position.altitude_m);
+}
+
+/**
  * @brief Procesa una línea NMEA completa.
  */
 static void process_nmea_line(char *line) {
-  // Solo nos interesan $GPRMC y $GNRMC (hora + posición)
+  // $GPRMC / $GNRMC: hora, fecha, posición, velocidad
   if (strncmp(line, "$GPRMC", 6) == 0 || strncmp(line, "$GNRMC", 6) == 0) {
     parse_rmc(line);
   }
-  // TODO: Parsear $GPGGA para altitud y cantidad de satélites si se necesita
+  // $GPGGA / $GNGGA: altitud, satélites, HDOP
+  else if (strncmp(line, "$GPGGA", 6) == 0 || strncmp(line, "$GNGGA", 6) == 0) {
+    parse_gga(line);
+  }
 }
 
 // ============================================================================

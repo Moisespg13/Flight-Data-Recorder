@@ -84,14 +84,14 @@ static const cev_param_id_t fmt2_word10[40] = {
     PARAM_LIBRE,   /* ID39 */  PARAM_LIBRE,   /* ID40 */
 };
 
-// Word 11: Sub-conmutada (ANA 26-32 en los primeros 7 frames, luego Libre)
+// Word 11: Sub-conmutada (ANA 26-32, luego GPS, luego Libre)
 static const cev_param_id_t fmt2_word11[40] = {
     PARAM_ANA_26,  /*  ID1 */  PARAM_ANA_27,  /*  ID2 */
     PARAM_ANA_28,  /*  ID3 */  PARAM_ANA_29,  /*  ID4 */
     PARAM_ANA_30,  /*  ID5 */  PARAM_ANA_31,  /*  ID6 */
-    PARAM_ANA_32,  /*  ID7 */  PARAM_LIBRE,   /*  ID8 */
-    PARAM_LIBRE,   /*  ID9 */  PARAM_LIBRE,   /* ID10 */
-    PARAM_LIBRE,   /* ID11 */  PARAM_LIBRE,   /* ID12 */
+    PARAM_ANA_32,  /*  ID7 */  PARAM_LAT_H,   /*  ID8 */
+    PARAM_LAT_L,   /*  ID9 */  PARAM_LON_H,   /* ID10 */
+    PARAM_LON_L,   /* ID11 */  PARAM_ALT,     /* ID12 */
     PARAM_LIBRE,   /* ID13 */  PARAM_LIBRE,   /* ID14 */
     PARAM_LIBRE,   /* ID15 */  PARAM_LIBRE,   /* ID16 */
     PARAM_LIBRE,   /* ID17 */  PARAM_LIBRE,   /* ID18 */
@@ -116,11 +116,11 @@ static const cev_param_id_t fmt3_table[10][6] = {
     /* ID3  */ {PARAM_DIG, PARAM_ANA_3,  PARAM_ANA_22, PARAM_ANA_32, PARAM_DSP_10, PARAM_ANO},
     /* ID4  */ {PARAM_DIG, PARAM_ANA_4,  PARAM_ANA_23, PARAM_DSP_1,  PARAM_DSP_11, PARAM_HOR},
     /* ID5  */ {PARAM_DIG, PARAM_ANA_5,  PARAM_ANA_24, PARAM_DSP_2,  PARAM_DSP_12, PARAM_MIN},
-    /* ID6  */ {PARAM_DIG, PARAM_ANA_6,  PARAM_ANA_25, PARAM_DSP_3,  PARAM_LIBRE,  PARAM_SEG},
-    /* ID7  */ {PARAM_DIG, PARAM_ANA_7,  PARAM_ANA_26, PARAM_DSP_4,  PARAM_LIBRE,  PARAM_LIBRE},
-    /* ID8  */ {PARAM_DIG, PARAM_ANA_8,  PARAM_ANA_27, PARAM_DSP_5,  PARAM_LIBRE,  PARAM_LIBRE},
-    /* ID9  */ {PARAM_DIG, PARAM_ANA_9,  PARAM_ANA_28, PARAM_DSP_6,  PARAM_LIBRE,  PARAM_LIBRE},
-    /* ID10 */ {PARAM_DIG, PARAM_ANA_10, PARAM_ANA_29, PARAM_DSP_7,  PARAM_LIBRE,  PARAM_LIBRE},
+    /* ID6  */ {PARAM_DIG, PARAM_ANA_6,  PARAM_ANA_25, PARAM_DSP_3,  PARAM_LAT_H,  PARAM_SEG},
+    /* ID7  */ {PARAM_DIG, PARAM_ANA_7,  PARAM_ANA_26, PARAM_DSP_4,  PARAM_LAT_L,  PARAM_LIBRE},
+    /* ID8  */ {PARAM_DIG, PARAM_ANA_8,  PARAM_ANA_27, PARAM_DSP_5,  PARAM_LON_H,  PARAM_LIBRE},
+    /* ID9  */ {PARAM_DIG, PARAM_ANA_9,  PARAM_ANA_28, PARAM_DSP_6,  PARAM_LON_L,  PARAM_LIBRE},
+    /* ID10 */ {PARAM_DIG, PARAM_ANA_10, PARAM_ANA_29, PARAM_DSP_7,  PARAM_ALT,    PARAM_LIBRE},
 };
 
 // ============================================================================
@@ -238,6 +238,24 @@ void sample_format_update_time(uint8_t day, uint8_t month, uint16_t year,
   s_params[PARAM_HOR] = (int16_t)hour;
   s_params[PARAM_MIN] = (int16_t)minute;
   s_params[PARAM_SEG] = (int16_t)second;
+}
+
+void sample_format_update_gnss(double latitude, double longitude, float altitude_m) {
+  // Lat/Lon: multiplicar por 1,000,000 para obtener microgrados (precisión ~0.11 m)
+  // y partir el int32 resultante en dos words de 16 bits.
+  int32_t lat_raw = (int32_t)(latitude * 1000000.0);
+  int32_t lon_raw = (int32_t)(longitude * 1000000.0);
+
+  s_params[PARAM_LAT_H] = (int16_t)((lat_raw >> 16) & 0xFFFF);
+  s_params[PARAM_LAT_L] = (int16_t)(lat_raw & 0xFFFF);
+  s_params[PARAM_LON_H] = (int16_t)((lon_raw >> 16) & 0xFFFF);
+  s_params[PARAM_LON_L] = (int16_t)(lon_raw & 0xFFFF);
+
+  // Altitud: convertir metros a pies (1 m = 3.28084 ft), saturar a int16
+  float alt_ft = altitude_m * 3.28084f;
+  if (alt_ft > 32767.0f) alt_ft = 32767.0f;
+  if (alt_ft < -32768.0f) alt_ft = -32768.0f;
+  s_params[PARAM_ALT] = (int16_t)roundf(alt_ft);
 }
 
 // --- Ensamblado de frames ---

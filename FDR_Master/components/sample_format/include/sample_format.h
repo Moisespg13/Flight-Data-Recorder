@@ -44,6 +44,13 @@ typedef enum {
   // Tiempo real (GNSS)
   PARAM_DIA, PARAM_MES, PARAM_ANO, PARAM_HOR, PARAM_MIN, PARAM_SEG,
 
+  // Posición GNSS (32 bits divididos en 2 words de 16 bits c/u)
+  PARAM_LAT_H,   // Latitud: bits 31-16  (1 LSB = ~0.11 m)
+  PARAM_LAT_L,   // Latitud: bits 15-0
+  PARAM_LON_H,   // Longitud: bits 31-16
+  PARAM_LON_L,   // Longitud: bits 15-0
+  PARAM_ALT,     // Altitud en pies (1 LSB = 1 ft)
+
   // Palabra libre (se graba como 0x0000)
   PARAM_LIBRE,
 
@@ -130,6 +137,9 @@ void sample_format_update_dsp12(int16_t sync_value);
 /** @brief Actualiza fecha y hora desde el GNSS. */
 void sample_format_update_time(uint8_t day, uint8_t month, uint16_t year,
                                uint8_t hour, uint8_t minute, uint8_t second);
+
+/** @brief Actualiza posición GNSS: Lat/Lon (double→ 2×int16) y Altitud (m→ft→int16). */
+void sample_format_update_gnss(double latitude, double longitude, float altitude_m);
 
 /**
  * @brief Ensambla un frame CEV según el formato activo.
