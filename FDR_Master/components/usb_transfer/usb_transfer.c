@@ -352,11 +352,30 @@ esp_err_t usb_transfer_copy_all(void) {
       snprintf(dst_path, sizeof(dst_path), "%s/%s", USB_MOUNT_POINT,
                entry->d_name);
 
-      esp_err_t ret = copy_file(src_path, dst_path);
+      esp_err_t ret = ESP_FAIL;
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        ret = copy_file(src_path, dst_path);
+        if (ret == ESP_OK) {
+          break; // Copia exitosa
+        }
+        ESP_LOGW(TAG, "Intento %d de 3 fallido para %s", attempt, entry->d_name);
+        if (attempt < 3) {
+          vTaskDelay(pdMS_TO_TICKS(1000)); // Esperar 1s antes de reintentar
+        }
+      }
+
       if (ret == ESP_OK) {
         files_copied++;
       } else {
         errors++;
+        // Si falla después de 3 intentos, generar archivo .ERR
+        char err_path[280];
+        snprintf(err_path, sizeof(err_path), "%s/ERROR_USB.ERR", USB_MOUNT_POINT);
+        FILE *ferr = fopen(err_path, "w");
+        if (ferr != NULL) {
+          fprintf(ferr, "ERROR FATAL: Falla de E/S al copiar %s tras 3 intentos.\n", entry->d_name);
+          fclose(ferr);
+        }
       }
     }
   }

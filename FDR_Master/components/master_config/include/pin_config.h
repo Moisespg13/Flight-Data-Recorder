@@ -139,6 +139,7 @@
 #define PIN_SPI_DRDY 45
 
 // ============================================================================
-// PINES LIBRES
+// PINES LIBRES / OTROS
 // ============================================================================
-// GPIO0  - Libre (⚠️ STRAP pin, usar con precaución)
+#define PIN_LED 0       // Indicador de estado (Verde) - Active LOW (Drenador)
+// GPIO34 - Libre

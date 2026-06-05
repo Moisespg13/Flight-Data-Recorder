@@ -35,6 +35,7 @@
 #include "freertos/task.h"
 #include "gnss.h"
 #include "imu_xsens.h"
+#include "led_indicator.h"
 #include "nvs.h"
 #include "pin_config.h"
 #include "protocol.h"
@@ -63,6 +64,9 @@ static uint8_t s_frame_counter = 0;
 
 // Handle de la tarea escritora (para notificación de power-loss)
 static TaskHandle_t s_writer_task_handle = NULL;
+
+// Bandera para abortar escritura si la SD se llena en vuelo
+static bool s_recording_aborted = false;
 
 // ============================================================================
 // ISR de Detección de Pérdida de Energía
@@ -131,6 +135,7 @@ static void tsk_frame_writer_master(void *pvParameters) {
   esp_err_t ret = sd_storage_open_flight_file(sample_format_get_active());
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "*** ERROR: No se pudo crear archivo de vuelo.");
+    led_set_mode(LED_MODE_FLIGHT_ERROR);
     vTaskDelete(NULL);
     return;
   }
@@ -174,10 +179,27 @@ static void tsk_frame_writer_master(void *pvParameters) {
     for (int f = 0; f < frames_per_tick; f++) {
       int words = sample_format_assemble_frame(s_frame_counter, s_frame_buf);
 
-      if (words > 0) {
+      if (words > 0 && !s_recording_aborted) {
         ret = sd_storage_write(s_frame_buf, (size_t)words * sizeof(int16_t));
         if (ret != ESP_OK) {
-          ESP_LOGE(TAG, "Error al escribir frame %d en SD!", s_frame_counter);
+          ESP_LOGE(TAG, "Error crítico: Fallo de escritura en SD (posible SD llena). Abortando grabación.");
+          s_recording_aborted = true;
+          
+          // 1. Indicar visualmente el error
+          led_set_mode(LED_MODE_FLIGHT_ERROR);
+          
+          // 2. Cerrar archivo limpiamente para no corromper la FAT32
+          sd_storage_close();
+          
+          // 3. Intentar grabar log de error (puede fallar si está 100% llena)
+          FILE *err_f = fopen("/sdcard/FDR_FULL.ERR", "w");
+          if (err_f != NULL) {
+            fprintf(err_f, "Falla en Modo Vuelo: SD llena o error de I/O en frame %d.\n", s_frame_counter);
+            fclose(err_f);
+            ESP_LOGI(TAG, "Log de error creado en la SD.");
+          } else {
+            ESP_LOGW(TAG, "No se pudo crear log de error, la SD está completamente llena.");
+          }
         }
       }
 

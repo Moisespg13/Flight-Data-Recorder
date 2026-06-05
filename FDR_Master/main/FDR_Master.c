@@ -23,6 +23,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "led_indicator.h"
 #include "master_logic.h"
 #include "pin_config.h"
 #include "protocol.h"
@@ -98,18 +99,22 @@ static void run_download_mode(void) {
   if (!usb_transfer_is_ready()) {
     ESP_LOGE(TAG, "ERROR: Pendrive no disponible después de esperar");
     usb_transfer_deinit();
+    led_set_mode(LED_MODE_DOWNLOAD_ERROR);
     return;
   }
 
   // 3. Copiar archivos
   ESP_LOGI(TAG, "Iniciando copia de archivos a pendrive...");
+  led_set_mode(LED_MODE_DOWNLOAD_PROGRESS);
   ret = usb_transfer_copy_all();
   if (ret == ESP_OK) {
     ESP_LOGI(TAG, "************************************");
     ESP_LOGI(TAG, "***   DESCARGA COMPLETADA OK     ***");
     ESP_LOGI(TAG, "************************************");
+    led_set_mode(LED_MODE_DOWNLOAD_DONE);
   } else {
     ESP_LOGE(TAG, "*** DESCARGA CON ERRORES ***");
+    led_set_mode(LED_MODE_DOWNLOAD_ERROR);
   }
 
   // 4. Limpiar
@@ -134,9 +139,12 @@ static void run_flight_mode(void) {
            PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CLK, PIN_SPI_CS);
   ESP_LOGI(TAG, "Protocol Magic: 0x%02X", FDR_PROTO_MAGIC);
 
+  led_set_mode(LED_MODE_FLIGHT_OK);
+
   esp_err_t ret = master_logic_start();
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Error fatal al iniciar lógica del Maestro!");
+    led_set_mode(LED_MODE_FLIGHT_ERROR);
   }
 }
 
@@ -151,6 +159,9 @@ void app_main(void) {
   ESP_ERROR_CHECK(ret);
 
   ESP_LOGI(TAG, "=== FDR MAESTRO (ESP32-S3) ===");
+
+  // Inicializar LED de estado
+  led_init();
 
   // Detectar modo automáticamente (pendrive = descarga, sin pendrive = vuelo)
   mad_mode_t mode = detect_boot_mode();
