@@ -38,18 +38,37 @@ esp_err_t discrete_signals_init(void) {
   return ESP_OK;
 }
 
+#define DEBOUNCE_SAMPLES 3
+
+static uint16_t s_debounced_state = 0;
+static uint8_t s_debounce_counters[NUM_DISCRETE_INPUTS] = {0};
+
 esp_err_t discrete_signals_read(uint16_t *states) {
   if (states == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  uint16_t result = 0;
   for (int i = 0; i < NUM_DISCRETE_INPUTS; i++) {
-    if (gpio_get_level(disc_pins[i])) {
-      result |= (1U << i);
+    bool is_high = gpio_get_level(disc_pins[i]);
+    bool currently_debounced_high = (s_debounced_state & (1U << i)) != 0;
+
+    if (is_high != currently_debounced_high) {
+      s_debounce_counters[i]++;
+      if (s_debounce_counters[i] >= DEBOUNCE_SAMPLES) {
+        // Confirmado el cambio de estado (debounced)
+        if (is_high) {
+          s_debounced_state |= (1U << i);
+        } else {
+          s_debounced_state &= ~(1U << i);
+        }
+        s_debounce_counters[i] = 0;
+      }
+    } else {
+      // Si el estado vuelve al valor filtrado, reseteamos el contador
+      s_debounce_counters[i] = 0;
     }
   }
 
-  *states = result;
+  *states = s_debounced_state;
   return ESP_OK;
 }

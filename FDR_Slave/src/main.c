@@ -29,6 +29,7 @@
 
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
+#include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
 
@@ -137,6 +138,13 @@ static void shared_gpio_callback(uint gpio, uint32_t events) {
   if (gpio == PIN_SYNC_TRIG && (events & GPIO_IRQ_EDGE_RISE)) {
     if (h_tsk_coordinator != NULL) {
       vTaskNotifyGiveFromISR(h_tsk_coordinator, &xHigherPriorityTaskWoken);
+    }
+  }
+
+  if (gpio == PIN_LINK_CS && (events & GPIO_IRQ_EDGE_RISE)) {
+    gpio_put(PIN_DRDY, 0); // Bajar DRDY rápido para handshake
+    if (h_tsk_spi_link != NULL) {
+      vTaskNotifyGiveIndexedFromISR(h_tsk_spi_link, 2, &xHigherPriorityTaskWoken);
     }
   }
 
@@ -394,6 +402,23 @@ static void tsk_time_sync_slave(void *pvParameters) {
 }
 
 // ============================================================================
+// Tarea: Watchdog (Prioridad 1 - MUY BAJA)
+// ============================================================================
+/**
+ * @brief Perro guardián por software/hardware.
+ *        Prioridad muy baja. Si las tareas de adquisición o SPI (prioridades 6-8)
+ *        entran en bucle infinito o se cuelgan, esta tarea sufrirá "starvation"
+ *        y el micro se reseteará físicamente a los 2 segundos.
+ */
+static void tsk_watchdog_slave(void *pvParameters) {
+  (void)pvParameters;
+  while (true) {
+    watchdog_update();
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ============================================================================
 // Hooks de FreeRTOS
 // ============================================================================
 
@@ -498,7 +523,14 @@ int main(void) {
   xTaskCreate(tsk_coordinator_slave, "coordinator", 768, NULL, 8,
               &h_tsk_coordinator);
 
-  printf("[MAIN] 5 tareas creadas. Arrancando scheduler de FreeRTOS...\n");
+  // Tarea de Watchdog: prioridad mínima (1)
+  xTaskCreate(tsk_watchdog_slave, "watchdog", 256, NULL, 1, NULL);
+
+  // Habilitar Watchdog por hardware (2000 ms, pausar en debug)
+  watchdog_enable(2000, 1);
+  printf("[MAIN] Watchdog por hardware habilitado (2000 ms).\n");
+
+  printf("[MAIN] 6 tareas creadas. Arrancando scheduler de FreeRTOS...\n");
 
   // 7. Arrancar el scheduler (nunca retorna)
   vTaskStartScheduler();

@@ -40,6 +40,7 @@ typedef enum {
   PARAM_DSP_1,  PARAM_DSP_2,  PARAM_DSP_3,  PARAM_DSP_4,
   PARAM_DSP_5,  PARAM_DSP_6,  PARAM_DSP_7,  PARAM_DSP_8,
   PARAM_DSP_9,  PARAM_DSP_10, PARAM_DSP_11, PARAM_DSP_12,
+  PARAM_DSP_13,
 
   // Tiempo real (GNSS)
   PARAM_DIA, PARAM_MES, PARAM_ANO, PARAM_HOR, PARAM_MIN, PARAM_SEG,
@@ -129,7 +130,7 @@ void sample_format_update_discrete(uint16_t states);
 void sample_format_update_imu(float acc_x, float acc_y, float acc_z,
                               float gyr_x, float gyr_y, float gyr_z,
                               float mag_x, float mag_y, float mag_z,
-                              float roll, float pitch);
+                              float roll, float pitch, float yaw);
 
 /** @brief Actualiza DSP 12 (señal de sincronismo PPS). */
 void sample_format_update_dsp12(int16_t sync_value);

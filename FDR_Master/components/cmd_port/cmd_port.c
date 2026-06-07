@@ -35,7 +35,7 @@
 static const char *TAG = "CMD_PORT";
 
 // Configuración UART
-#define CMD_BAUD_RATE 9600
+#define CMD_BAUD_RATE 115200
 #define CMD_BUF_SIZE  256
 
 // Clave NVS para almacenar el formato de muestreo
@@ -235,8 +235,7 @@ static void process_message(const cmd_message_t *msg) {
 // ============================================================================
 
 esp_err_t cmd_port_init(void) {
-  // Para TB4 compartimos el UART0 (Consola). Usamos 115200 baudios en lugar de 9600.
-  int baud_rate = (CMD_UART_NUM == 0) ? 115200 : CMD_BAUD_RATE;
+  int baud_rate = CMD_BAUD_RATE;
 
   ESP_LOGI(TAG, "Inicializando Puerto de Comandos (UART%d, %d baud)...",
            CMD_UART_NUM, baud_rate);

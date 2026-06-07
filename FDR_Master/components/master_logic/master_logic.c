@@ -363,7 +363,7 @@ static void tsk_imu_master(void *pvParameters) {
             imu_data.acc_x, imu_data.acc_y, imu_data.acc_z,
             imu_data.gyr_x, imu_data.gyr_y, imu_data.gyr_z,
             imu_data.mag_x, imu_data.mag_y, imu_data.mag_z,
-            imu_data.roll, imu_data.pitch);
+            imu_data.roll, imu_data.pitch, imu_data.yaw);
       }
     }
 

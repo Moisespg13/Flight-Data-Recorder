@@ -55,7 +55,7 @@ static const cev_param_id_t fmt1_word17[40] = {
     PARAM_DIA,     /* ID33 */  PARAM_MES,     /* ID34 */
     PARAM_ANO,     /* ID35 */  PARAM_HOR,     /* ID36 */
     PARAM_MIN,     /* ID37 */  PARAM_SEG,     /* ID38 */
-    PARAM_LIBRE,   /* ID39 */  PARAM_LIBRE,   /* ID40 */
+    PARAM_DSP_13,  /* ID39 */  PARAM_LIBRE,   /* ID40 */
 };
 
 // ---------- FORMATO 2: 40 frames × 11 words ----------
@@ -92,7 +92,7 @@ static const cev_param_id_t fmt2_word11[40] = {
     PARAM_ANA_32,  /*  ID7 */  PARAM_LAT_H,   /*  ID8 */
     PARAM_LAT_L,   /*  ID9 */  PARAM_LON_H,   /* ID10 */
     PARAM_LON_L,   /* ID11 */  PARAM_ALT,     /* ID12 */
-    PARAM_LIBRE,   /* ID13 */  PARAM_LIBRE,   /* ID14 */
+    PARAM_DSP_13,  /* ID13 */  PARAM_LIBRE,   /* ID14 */
     PARAM_LIBRE,   /* ID15 */  PARAM_LIBRE,   /* ID16 */
     PARAM_LIBRE,   /* ID17 */  PARAM_LIBRE,   /* ID18 */
     PARAM_LIBRE,   /* ID19 */  PARAM_LIBRE,   /* ID20 */
@@ -117,7 +117,7 @@ static const cev_param_id_t fmt3_table[10][6] = {
     /* ID4  */ {PARAM_DIG, PARAM_ANA_4,  PARAM_ANA_23, PARAM_DSP_1,  PARAM_DSP_11, PARAM_HOR},
     /* ID5  */ {PARAM_DIG, PARAM_ANA_5,  PARAM_ANA_24, PARAM_DSP_2,  PARAM_DSP_12, PARAM_MIN},
     /* ID6  */ {PARAM_DIG, PARAM_ANA_6,  PARAM_ANA_25, PARAM_DSP_3,  PARAM_LAT_H,  PARAM_SEG},
-    /* ID7  */ {PARAM_DIG, PARAM_ANA_7,  PARAM_ANA_26, PARAM_DSP_4,  PARAM_LAT_L,  PARAM_LIBRE},
+    /* ID7  */ {PARAM_DIG, PARAM_ANA_7,  PARAM_ANA_26, PARAM_DSP_4,  PARAM_LAT_L,  PARAM_DSP_13},
     /* ID8  */ {PARAM_DIG, PARAM_ANA_8,  PARAM_ANA_27, PARAM_DSP_5,  PARAM_LON_H,  PARAM_LIBRE},
     /* ID9  */ {PARAM_DIG, PARAM_ANA_9,  PARAM_ANA_28, PARAM_DSP_6,  PARAM_LON_L,  PARAM_LIBRE},
     /* ID10 */ {PARAM_DIG, PARAM_ANA_10, PARAM_ANA_29, PARAM_DSP_7,  PARAM_ALT,    PARAM_LIBRE},
@@ -212,7 +212,7 @@ void sample_format_update_discrete(uint16_t states) {
 void sample_format_update_imu(float acc_x, float acc_y, float acc_z,
                               float gyr_x, float gyr_y, float gyr_z,
                               float mag_x, float mag_y, float mag_z,
-                              float roll, float pitch) {
+                              float roll, float pitch, float yaw) {
   s_params[PARAM_DSP_1]  = float_to_int16(acc_x, IMU_SCALE_ACC);
   s_params[PARAM_DSP_2]  = float_to_int16(acc_y, IMU_SCALE_ACC);
   s_params[PARAM_DSP_3]  = float_to_int16(acc_z, IMU_SCALE_ACC);
@@ -224,6 +224,7 @@ void sample_format_update_imu(float acc_x, float acc_y, float acc_z,
   s_params[PARAM_DSP_9]  = float_to_int16(mag_z, IMU_SCALE_MAG);
   s_params[PARAM_DSP_10] = float_to_int16(roll,  IMU_SCALE_EULER);
   s_params[PARAM_DSP_11] = float_to_int16(pitch, IMU_SCALE_EULER);
+  s_params[PARAM_DSP_13] = float_to_int16(yaw,   IMU_SCALE_EULER);
 }
 
 void sample_format_update_dsp12(int16_t sync_value) {
