@@ -95,6 +95,12 @@ static void tsk_spi_link_master(void *pvParameters) {
   ESP_LOGI(TAG, "Esperando 500ms para que el Slave arranque...");
   vTaskDelay(pdMS_TO_TICKS(500));
 
+  // Trama Despertador (Dummy transaction para bajar el CS y despertar al esclavo)
+  ESP_LOGI(TAG, "Enviando Trama Despertador al Esclavo...");
+  memset(&t, 0, sizeof(t));
+  t.length = 8; // 8 bits dummy
+  spi_device_transmit(spi_dev, &t);
+
   while (1) {
     // ================================================================
     // PASO 1: Esperar DRDY HIGH (Slave tiene datos listos)
@@ -114,7 +120,15 @@ static void tsk_spi_link_master(void *pvParameters) {
                    (int)(DRDY_TIMEOUT_US / 1000),
                    (unsigned long)drdy_timeout_count);
         }
+        
+        // POKE AL ESCLAVO: Si el esclavo se reinició o prendió tarde, estará
+        // esperando un flanco de bajada en el CS. Le mandamos una trama vacía.
+        memset(&t, 0, sizeof(t));
+        t.length = 8;
+        spi_device_transmit(spi_dev, &t);
+
         wait_start = esp_timer_get_time(); // Reset para no spamear
+        vTaskDelay(pdMS_TO_TICKS(1)); // Liberar CPU 1ms para resetear el Watchdog (TWDT)
       }
     }
 

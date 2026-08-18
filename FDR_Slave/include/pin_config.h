@@ -49,12 +49,10 @@
 #define PIN_LINK_CS   0   // GP0  - CS    (desde ESP32 Master)
 #define PIN_LINK_TX   1   // GP1  - MISO  (datos hacia ESP32 Master)
 #define PIN_LINK_SCK  2   // GP2  - Clock (desde ESP32 Master)
-#define PIN_LINK_RX   3   // GP3  - MOSI  (datos desde ESP32 Master)
 
 // ============================================================================
 // SEÑALES DE SINCRONIZACIÓN
 // ============================================================================
-#define PIN_SYNC_TRIG     14  // GP14 - Entrada desde Maestro (arranca adquisición)
 #define PIN_PPS           26  // GP26 - Entrada PPS desde GNSS
 
 // ============================================================================
@@ -70,7 +68,7 @@
 // ============================================================================
 // DATA READY (Slave -> Master)
 // ============================================================================
-#define PIN_DRDY          8   // GP8  - Señal DRDY: HIGH = paquete listo para leer
+#define PIN_DRDY          3   // GP3  - Señal DRDY: HIGH = paquete listo para leer
 
 // ============================================================================
 // PINES LIBRES (reservados para uso futuro)

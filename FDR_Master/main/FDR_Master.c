@@ -135,8 +135,8 @@ static void run_flight_mode(void) {
   ESP_LOGI(TAG, "************************************");
   ESP_LOGI(TAG, "***     MODO VUELO ACTIVADO      ***");
   ESP_LOGI(TAG, "************************************");
-  ESP_LOGI(TAG, "Pines SPI Link: MISO=%d, MOSI=%d, CLK=%d, CS=%d",
-           PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CLK, PIN_SPI_CS);
+  ESP_LOGI(TAG, "Pines SPI Link: MISO=%d, CLK=%d, CS=%d",
+           PIN_SPI_MISO, PIN_SPI_CLK, PIN_SPI_CS);
   ESP_LOGI(TAG, "Protocol Magic: 0x%02X", FDR_PROTO_MAGIC);
 
   led_set_mode(LED_MODE_FLIGHT_OK);

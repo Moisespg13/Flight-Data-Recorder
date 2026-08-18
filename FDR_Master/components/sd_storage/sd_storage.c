@@ -253,15 +253,28 @@ esp_err_t sd_storage_init(void) {
   // Activar pull-ups internos
   slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-  // Montar filesystem
+  // Montar filesystem con sistema de reintentos (hasta 3 veces)
   ESP_LOGI(TAG, "Montando sistema de archivos...");
-  esp_err_t ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+  
+  esp_err_t ret = ESP_FAIL;
+  int max_retries = 3;
+  int retry_count = 0;
+  
+  while (retry_count < max_retries) {
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+    if (ret == ESP_OK) {
+        break;
+    }
+    retry_count++;
+    ESP_LOGW(TAG, "Fallo al montar (Intento %d/%d). Reintentando en 500ms...", retry_count, max_retries);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
 
   if (ret != ESP_OK) {
     if (ret == ESP_FAIL) {
-      ESP_LOGE(TAG, "Fallo al montar (formato incorrecto o sin tarjeta). Formatear a FAT32 en PC.");
+      ESP_LOGE(TAG, "Fallo al montar tras %d intentos (formato incorrecto o sin tarjeta). Formatear a FAT32 en PC.", max_retries);
     } else {
-      ESP_LOGE(TAG, "Error montando tarjeta: %s", esp_err_to_name(ret));
+      ESP_LOGE(TAG, "Error montando tarjeta tras %d intentos: %s", max_retries, esp_err_to_name(ret));
     }
     return ret;
   }

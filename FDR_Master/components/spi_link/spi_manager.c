@@ -22,7 +22,7 @@ esp_err_t spi_manager_init(void) {
 
   spi_bus_config_t buscfg = {
       .miso_io_num = PIN_SPI_MISO,
-      .mosi_io_num = PIN_SPI_MOSI,
+      .mosi_io_num = -1,
       .sclk_io_num = PIN_SPI_CLK,
       .quadwp_io_num = -1,
       .quadhd_io_num = -1,

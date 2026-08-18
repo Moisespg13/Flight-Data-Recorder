@@ -135,7 +135,7 @@ static volatile uint64_t s_pps_edge_us = 0;
 static void shared_gpio_callback(uint gpio, uint32_t events) {
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-  if (gpio == PIN_SYNC_TRIG && (events & GPIO_IRQ_EDGE_RISE)) {
+  if (gpio == PIN_LINK_CS && (events & GPIO_IRQ_EDGE_FALL)) {
     if (h_tsk_coordinator != NULL) {
       vTaskNotifyGiveFromISR(h_tsk_coordinator, &xHigherPriorityTaskWoken);
     }
@@ -173,20 +173,18 @@ static void shared_gpio_callback(uint gpio, uint32_t events) {
 static void tsk_coordinator_slave(void *pvParameters) {
   (void)pvParameters;
 
-  // GPIO ya configurado en main(). Verificar si SYNC_TRIG ya está en HIGH.
-  if (gpio_get(PIN_SYNC_TRIG) == 0) {
-    printf("[COORD] Esperando SYNC_TRIG en GP%d (por interrupción)...\n",
-           PIN_SYNC_TRIG);
-    // Bloquearse hasta que la ISR de SYNC_TRIG notifique (index 0)
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  } else {
-    printf("[COORD] SYNC_TRIG ya estaba en HIGH al arrancar.\n");
-  }
+  // Configurar interrupción para el flanco de bajada y subida del CS
+  // La subida la maneja spi_link, pero la bajada despertará a este coordinador
+  gpio_set_irq_enabled_with_callback(PIN_LINK_CS, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, &shared_gpio_callback);
+
+  printf("[COORD] Esperando Trama SPI Despertador (CS LOW) en GP%d...\n", PIN_LINK_CS);
+  // Bloquearse hasta que la ISR nos notifique
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
   printf("[COORD] *** SYNC recibido! Despertando tareas... ***\n");
 
-  // Deshabilitar IRQ de SYNC_TRIG (ya no la necesitamos)
-  gpio_set_irq_enabled(PIN_SYNC_TRIG, GPIO_IRQ_EDGE_RISE, false);
+  // Deshabilitar IRQ de bajada (ya no la necesitamos), dejamos la de subida para spi_link
+  gpio_set_irq_enabled(PIN_LINK_CS, GPIO_IRQ_EDGE_FALL, false);
   h_tsk_coordinator = NULL; // Prevenir que la ISR notifique a tarea eliminada
 
   // Despierta a todas las tareas bloqueadas (Task Notification, index 0)
@@ -493,22 +491,16 @@ int main(void) {
   printf("[MAIN] Colas creadas (fast:%d, slow:%d).\n", FAST_DATA_QUEUE_DEPTH,
          SLOW_DATA_QUEUE_DEPTH);
 
-  // 5.5 Configurar interrupciones GPIO para SYNC_TRIG y PPS
+  // 5.5 Configurar interrupciones GPIO para PPS
   //     (debe hacerse desde core 0 antes del scheduler para SMP)
-  gpio_init(PIN_SYNC_TRIG);
-  gpio_set_dir(PIN_SYNC_TRIG, GPIO_IN);
-  gpio_pull_down(PIN_SYNC_TRIG);
-
   gpio_init(PIN_PPS);
   gpio_set_dir(PIN_PPS, GPIO_IN);
   gpio_pull_down(PIN_PPS);
 
   // Registrar callback compartido y habilitar interrupciones
-  gpio_set_irq_enabled_with_callback(PIN_SYNC_TRIG, GPIO_IRQ_EDGE_RISE, true,
+  gpio_set_irq_enabled_with_callback(PIN_PPS, GPIO_IRQ_EDGE_RISE, true,
                                       shared_gpio_callback);
-  gpio_set_irq_enabled(PIN_PPS, GPIO_IRQ_EDGE_RISE, true);
-  printf("[MAIN] Interrupciones GPIO configuradas (SYNC=GP%d, PPS=GP%d).\n",
-         PIN_SYNC_TRIG, PIN_PPS);
+  printf("[MAIN] Interrupciones GPIO configuradas (PPS=GP%d).\n", PIN_PPS);
 
   // 6. Crear tareas de trabajo (arrancan bloqueadas esperando al coordinator)
   xTaskCreate(tsk_acq_fast_slave, "acq_fast", 1024, NULL, 7, &h_tsk_acq_fast);

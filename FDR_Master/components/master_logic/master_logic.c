@@ -400,28 +400,16 @@ static void tsk_cmd_port_master(void *pvParameters) {
 
   while (1) {
     cmd_port_process();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // 5 ms (200 Hz): baja la latencia de respuesta del puerto de comandos.
+    // cmd_port_process() es no bloqueante, así que sondear rápido es barato
+    // y hace que el monitor RS-232 refresque mucho más ágil.
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
 // ============================================================================
-// Configuración de la señal SYNC_TRIG
-// ============================================================================
-static esp_err_t sync_trigger_init(void) {
-  gpio_config_t io_conf = {
-      .pin_bit_mask = (1ULL << PIN_SYNC_TRIG),
-      .mode = GPIO_MODE_OUTPUT,
-      .pull_up_en = GPIO_PULLUP_DISABLE,
-      .pull_down_en = GPIO_PULLDOWN_DISABLE,
-      .intr_type = GPIO_INTR_DISABLE,
-  };
-  esp_err_t ret = gpio_config(&io_conf);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-  gpio_set_level(PIN_SYNC_TRIG, 0);
-  return ESP_OK;
-}
+// El trigger de sincronización ahora lo maneja la primera transacción SPI (flanco de CS)
+// Se ha eliminado la señal física SYNC_TRIG.
 
 // ============================================================================
 // API Pública
@@ -430,16 +418,11 @@ esp_err_t master_logic_start(void) {
   ESP_LOGI(TAG, "Arrancando Lógica de Maestro...");
 
   // 0. Configurar señal de sincronización
-  esp_err_t ret = sync_trigger_init();
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Error al configurar SYNC_TRIG");
-    return ret;
-  }
-  ESP_LOGI(TAG, "SYNC_TRIG (GPIO %d) configurado como salida.", PIN_SYNC_TRIG);
+  // Ya no se requiere inicializar SYNC_TRIG físicamente
 
   // 1. Leer formato de muestreo desde NVS e inicializar ensamblador
   uint8_t format = read_format_from_nvs();
-  ret = sample_format_init(format);
+  esp_err_t ret = sample_format_init(format);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Error al inicializar formato de muestreo");
     return ret;
@@ -574,9 +557,9 @@ esp_err_t master_logic_start(void) {
     ESP_LOGW(TAG, "No se pudo configurar Power-Loss GPIO (continuando)");
   }
 
-  // 17. Disparar sincronización: Esclavo puede arrancar
-  ESP_LOGI(TAG, "Maestro listo. Enviando SYNC_TRIG al Esclavo (RP2040)...");
-  gpio_set_level(PIN_SYNC_TRIG, 1);
+  // 17. Sincronización
+  // El Esclavo despertará cuando el módulo spi_link inicie su primera transacción (CS LOW)
+  ESP_LOGI(TAG, "Maestro listo. Iniciando polling SPI (despertará al Esclavo).");
 
   return ESP_OK;
 }

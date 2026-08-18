@@ -21,7 +21,6 @@
 // ============================================================================
 #define PIN_LINK_SPI_HOST SPI2_HOST
 #define PIN_SPI_MISO 13
-#define PIN_SPI_MOSI 11
 #define PIN_SPI_CLK  12
 #define PIN_SPI_CS   10
 
@@ -105,9 +104,8 @@
 #define CMD_UART_NUM 1   // UART1
 
 // ============================================================================
-// SEÑALES DE SINCRONIZACIÓN INTER-PLACA
+// SEÑALES DE SINCRONIZACIÓN INTER-PLACA (Eliminadas, ahora por SPI CS)
 // ============================================================================
-#define PIN_SYNC_TRIG 9  // Salida: Maestro -> Esclavo (arranca adquisición)
 
 // ============================================================================
 // DETECCIÓN DE PÉRDIDA DE ENERGÍA (POWER-LOSS)
@@ -133,10 +131,8 @@
 // ============================================================================
 // DATA READY (Slave -> Master)
 // ============================================================================
-// GPIO45 es STRAP pin (selecciona voltaje VDD_SPI al bootear).
-// Es seguro usarlo como input después del boot porque DRDY arranca LOW
-// (el esclavo no aserta DRDY hasta recibir SYNC_TRIG).
-#define PIN_SPI_DRDY 45
+// Movido a GPIO11 (antes era MOSI) para evitar conflictos de strapping.
+#define PIN_SPI_DRDY 11
 
 // ============================================================================
 // PINES LIBRES / OTROS
