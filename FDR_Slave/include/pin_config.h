@@ -28,7 +28,7 @@
 // Chip Selects de los ADCs (manejados como GPIO)
 #define PIN_CS_AD7606_1   5   // GP5  - CS del primer AD7606 (8 canales rápidos)
 #define PIN_CS_AD7606_2   27  // GP27 - CS del segundo AD7606 (8 canales rápidos)
-#define PIN_CS_AD4131     9   // GP9  - CS del AD4131 (16 canales lentos)
+#define PIN_CS_AD7490     9   // GP9  - CS del AD7490 (16 canales lentos)
 
 // Señales de control del AD7606
 #define PIN_ADC_CONVST    10  // GP10 - Conversion Start (compartido ambos AD7606)
@@ -36,8 +36,8 @@
 #define PIN_ADC2_BUSY     28  // GP28 - Busy (AD7606 #2)
 #define PIN_ADC_RST       15  // GP15 - Reset (compartido)
 
-// Señales de control del AD4131 (ADC lento)
-#define PIN_AD4131_DRDY   29  // GP29 - Data Ready (activo bajo)
+// Señales de control del AD7490 (ADC lento)
+// (No requiere DRDY)
 
 // ============================================================================
 // ENLACE INTER-PLACA (RP2040 como Slave <- ESP32-S3, vía PIO)

@@ -27,7 +27,7 @@ Encargada del procesamiento principal, almacenamiento, sincronización y comunic
 | GNSS | UART2 (9600 baud) | RX=35, TX=36, PPS=37 |
 | IMU Xsens | UART0 (115200 baud) | RX=44, TX=43 |
 | Puerto de Comandos RS-232 | UART1 (115200 baud) | RX=41, TX=42 (vía MAX3232E) |
-| Entradas Discretas | 16 GPIO directos | Lectura digital con pull-down interno |
+| Entradas Discretas | Expansor I2C TCA9555 | Lectura digital por bus I2C |
 | Señal de Sincronización | GPIO 9 | SYNC_TRIG → Esclavo (flanco de subida) |
 | Detección de Power-Loss | GPIO 46 | Comparador externo (~22V umbral) |
 | USB Host (Pendrive) | USB-OTG interno | Descarga de archivos a pendrive |
@@ -39,7 +39,7 @@ Co-procesador dedicado a la adquisición analógica de alta velocidad. Framework
 | Subsistema | Interfaz | Detalle |
 |------------|----------|---------|
 | ADC Rápido (16 ch) | SPI0 Master (10 MHz) | 2× AD7606, 16-bit SAR, muestreo simultáneo ≥ 3 kSPS |
-| ADC Lento (16 ch) | SPI0 Master (compartido) | 1× AD4131-8, 24-bit Sigma-Delta, ~150 Hz |
+| ADC Lento (16 ch) | SPI0 Master (compartido) | 1x AD7490, 12-bit SAR, ~20 Hz |
 | Enlace SPI con Maestro | PIO SPI Slave + DMA | GP1=MISO, GP2=SCK, GP0=CS, GP8=DRDY |
 | Sincronización | GP14 | SYNC_TRIG ← Maestro |
 | Disciplina de Reloj | GP26 | PPS ← GPS (< 4 µs de error) |
@@ -84,13 +84,13 @@ FDR/
 │   ├── src/
 │   │   ├── main.c               #   Entrada, 5 tareas, coordinator pattern
 │   │   ├── fast_signals.c       #   Driver AD7606 ×2 (16 canales rápidos)
-│   │   ├── slow_signals.c       #   Driver AD4131 (16 canales lentos)
+│   │   ├── slow_signals.c       #   Driver AD7490 (16 canales lentos)
 │   │   ├── spi_link_slave.c     #   Enlace SPI PIO (Slave TX)
 │   │   └── spi_slave_tx.pio     #   Máquina de estados PIO (3 instrucciones)
 │   ├── include/
 │   │   ├── pin_config.h         #   Mapa de pines del RP2040
 │   │   ├── fast_signals.h       #   API del AD7606
-│   │   ├── slow_signals.h       #   API del AD4131
+│   │   ├── slow_signals.h       #   API del AD7490
 │   │   ├── spi_link_slave.h     #   API del enlace SPI
 │   │   └── FreeRTOSConfig.h     #   Configuración FreeRTOS SMP dual-core
 │   └── lib/
@@ -116,7 +116,7 @@ FDR/
 | `sd_storage` | Almacenamiento en MicroSD vía SDMMC. Buffer de escritura de 4 KB, fsync periódico, header de archivo de 12 bytes con autodetección de formato. Verificación de espacio libre al inicio y aborto controlado si la SD se llena (genera archivo `.ERR`). |
 | `gnss` | Driver GNSS por UART. Parsea NMEA ($GPRMC + $GPGGA), captura PPS por ISR, mantiene reloj UTC calibrado. Provee fecha/hora, posición (Lat/Lon/Alt) y calidad del fix al ensamblador CEV. |
 | `imu_xsens` | Driver para IMU Xsens MTi por UART. Parsea el protocolo binario MT, extrae los 12 parámetros completos (aceleración, giróscopo, magnetómetro, roll, pitch, **yaw**) y los escala a int16. |
-| `discrete_signals` | Lee 16 GPIOs configurados como entrada con **debouncing por software** (N muestras consecutivas) y los empaqueta en un bitmap de 16 bits. |
+| `discrete_signals` | Lee 16 entradas mediante el expansor I2C TCA9555 con **debouncing por software** (N muestras consecutivas) y los empaqueta en un bitmap de 16 bits. |
 | `cmd_port` | Puerto RS-232 (115200 baud) para la notebook de mantenimiento. Protocolo de 6 bytes para leer canales, configurar el formato CEV en NVS y formatear la MicroSD (con clave de seguridad). |
 | `supervisor` | Watchdog de software. Cada tarea hace check-in periódico; si alguna excede su timeout, se registra una alarma. |
 | `usb_transfer` | USB Host MSC. Solo activo en Modo Descarga: copia archivos `FDR_*.bin` de la SD a un pendrive. |
@@ -126,7 +126,7 @@ FDR/
 | Módulo | Descripción |
 |--------|-------------|
 | `fast_signals` | Driver para 2× AD7606 (16 canales de 16-bit, muestreo simultáneo a 3 kHz). Usa SPI0 con mutex compartido. Disparo de conversión por pulso CONVST. |
-| `slow_signals` | Driver para 1× AD4131-8 (16 canales de 24-bit, ~150 Hz). Comparte SPI0 con el driver rápido. Espera DRDY sin el mutex para minimizar bloqueo. |
+| `slow_signals` | Driver para 1x AD7490 (16 canales de 12-bit, ~20 Hz). Comparte SPI0 con el driver r�pido. |
 | `spi_link_slave` | Empaqueta payloads con header + CRC32 y los transmite por **PIO + DMA de 32-bit** al Maestro, señalizando con DRDY. El canal DMA alimenta automáticamente el FIFO del PIO sin intervención de la CPU. |
 | `spi_slave_tx.pio` | Máquina de estados PIO de 3 instrucciones: espera SCK bajo → emite bit → espera SCK alto. Emula SPI Mode 0 bit-perfect. |
 | `time_sync` | Disciplina de reloj PPS. Detecta flancos del pulso de 1 Hz del GPS **por interrupción GPIO** y corrige el drift del oscilador interno (error < 4 µs). |
@@ -157,7 +157,7 @@ FDR/
 |:----:|-------|------:|-------------|
 | 8 | `tsk_coordinator_slave` | 768 B | Espera SYNC_TRIG del Maestro, desbloquea las tareas de trabajo, activa el watchdog y se autodestruye. |
 | 7 | `tsk_acq_fast_slave` | 1 KB | Lee los 2× AD7606 (16 ch) a 3 kHz y envía paquetes a `q_fast_data`. |
-| 6 | `tsk_acq_slow_slave` | 1 KB | Lee el AD4131 (16 ch) a ~150 Hz y envía paquetes a `q_slow_data`. |
+| 6 | `tsk_acq_slow_slave` | 1 KB | Lee el AD7490 (16 ch) a ~20 Hz y envía paquetes a `q_slow_data`. |
 | 6 | `tsk_spi_link_slave` | 1 KB | Desencola paquetes, agrega header + CRC32 y los transmite por PIO + DMA. |
 | 6 | `tsk_time_sync_slave` | 768 B | Detecta pulsos PPS por interrupción GPIO y corrige el drift del oscilador (< 4 µs de error). |
 | 1 | `tsk_watchdog_slave` | 512 B | Refresca el watchdog de hardware periódicamente. Si alguna tarea bloquea el sistema, el RP2040 se reinicia. |
@@ -269,9 +269,9 @@ python fdr_converter.py
 │                         │              │                                  │
 │ AD7606 ×2 ──► acq_fast ─┤              │  GPS ──UART──► gnss ──────────┐  │
 │ (16 ch, 3kHz)           │              │  IMU ──UART──► imu_xsens ───┐ │  │
-│                         │              │  16 GPIO ────► discrete ──┐ │ │  │
-│ AD4131 ────► acq_slow ──┤   SPI+DRDY   │                          │  │ │  │
-│ (16 ch, 150Hz)          ├─────────────►│  spi_link ──► data_proc──┤  │ │  │
+│                         │              │  TCA9555 -> I2C -> discrete ──┐ │ │  │
+│ AD7490 ────► acq_slow ──┤   SPI+DRDY   │                          │  │ │  │
+│ (16 ch, 20Hz)          ├─────────────►│  spi_link ──► data_proc──┤  │ │  │
 │                         │              │              slow_proc ──┤  │ │  │
 │ PPS ───────► time_sync  │              │                          ▼  ▼ ▼  │
 │ (< 4µs drift)           │              │              ┌──────────────────┐│
@@ -317,3 +317,4 @@ cmake ..
 make
 # Copiar .uf2 al RP2040 en modo BOOTSEL
 ```
+

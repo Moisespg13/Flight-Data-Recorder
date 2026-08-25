@@ -1,10 +1,10 @@
 
 /**
  * @file discrete_signals.h
- * @brief API pública del componente de lectura de señales discretas.
+ * @brief API pública del componente de lectura de señales discretas (TCA9555).
  *
- * Lee las 16 entradas digitales directas del ESP32-S3 (GPIO).
- * Reemplaza la funcionalidad que antes se hacía con los MAX22190.
+ * Lee las 16 entradas digitales usando el expansor I2C TCA9555, liberando
+ * 16 pines del ESP32-S3.
  */
 
 #pragma once

@@ -400,32 +400,14 @@ esp_err_t usb_transfer_deinit(void) {
 
   ESP_LOGI(TAG, "Cerrando USB Host...");
 
-  // Desmontar pendrive si está montado
+  // Desmontar pendrive si estǭ montado
   unmount_pendrive();
 
-  // Desinstalar driver MSC
-  msc_host_uninstall();
-
-  // Detener tarea USB
+  // Detener tarea USB de eventos
   if (s_usb_task_handle != NULL) {
     vTaskDelete(s_usb_task_handle);
     s_usb_task_handle = NULL;
   }
-
-  // Desinstalar stack USB Host
-  esp_err_t ret = usb_host_uninstall();
-  if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "Error al desinstalar USB Host: %s", esp_err_to_name(ret));
-  }
-
-  // Liberar cola
-  if (s_app_queue != NULL) {
-    vQueueDelete(s_app_queue);
-    s_app_queue = NULL;
-  }
-
-  s_initialized = false;
-  s_usb_ready = false;
 
   ESP_LOGI(TAG, "USB Host cerrado");
   return ESP_OK;

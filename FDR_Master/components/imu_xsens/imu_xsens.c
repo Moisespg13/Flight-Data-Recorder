@@ -174,9 +174,6 @@ static void parse_byte(uint8_t byte) {
 
     if (s_data_len == 0) {
       s_state = PARSE_CHECKSUM; // Sin datos, directo al checksum
-    } else if ((size_t)s_data_len > sizeof(s_data_buf)) {
-      ESP_LOGW(TAG, "Trama MT demasiado larga: %d bytes", s_data_len);
-      s_state = PARSE_IDLE; // Descartar
     } else {
       s_state = PARSE_DATA;
     }

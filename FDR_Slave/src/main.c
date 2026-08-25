@@ -8,7 +8,7 @@
  *                                     a las demás tareas, y se autodestruye.
  *   Prio 7 - tsk_acq_fast_slave:     Lee los ADCs (AD7606) vía SPI0
  *                                     y deposita los datos en q_fast_data.
- *   Prio 6 - tsk_acq_slow_slave:     Lee el ADC (AD4131) vía SPI0
+ *   Prio 6 - tsk_acq_slow_slave:     Lee el ADC (AD7490) vía SPI0
  *                                     y deposita los datos en q_slow_data.
  *   Prio 6 - tsk_spi_link_slave:     Recibe datos de ambas colas, empaqueta
  *                                     con Header + CRC, y transmite al Maestro
@@ -55,7 +55,7 @@
 static QueueHandle_t q_fast_data = NULL;
 static QueueHandle_t q_slow_data = NULL;
 
-// Mutex para acceso exclusivo al bus SPI0 (AD7606 vs AD4131)
+// Mutex para acceso exclusivo al bus SPI0 (AD7606 vs AD7490)
 static SemaphoreHandle_t spi0_mutex = NULL;
 
 // Handles de las tareas (para que el coordinator las despierte)
@@ -240,8 +240,10 @@ static void tsk_acq_fast_slave(void *pvParameters) {
     // Iniciar conversión (no necesita el bus SPI, solo pulsa CONVST)
     fast_signals_start_conversion();
 
-    // Leer datos (toma el mutex SPI0 internamente)
-    if (fast_signals_read(payload.channels) == 0) {
+    // Leer datos a un buffer intermedio para evitar unaligned pointer warning
+    int16_t temp_channels[FAST_SIGNALS_TOTAL_CH];
+    if (fast_signals_read(temp_channels) == 0) {
+      memcpy(payload.channels, temp_channels, sizeof(temp_channels));
       payload.timestamp_ns = get_calibrated_timestamp_ns();
 
       // Enviar a la cola (sin esperar si está llena, descarta)
@@ -260,7 +262,7 @@ static void tsk_acq_fast_slave(void *pvParameters) {
 // Tarea: Adquisición Lenta (Prioridad 6 - ALTA)
 // ============================================================================
 /**
- * @brief Lee datos del ADC AD4131 y los deposita en q_slow_data.
+ * @brief Lee datos del ADC AD7490 y los deposita en q_slow_data.
  *        Arranca bloqueada hasta que el coordinator la despierte.
  *
  * Muestrea los 16 canales lentos a ~20 Hz (FR-A2).
@@ -280,8 +282,10 @@ static void tsk_acq_slow_slave(void *pvParameters) {
   while (true) {
     memset(&payload, 0, sizeof(payload));
 
-    // Leer los 16 canales lentos (toma el mutex SPI0 internamente)
-    if (slow_signals_read(payload.channels) == 0) {
+    // Leer los 16 canales lentos a un buffer intermedio
+    int16_t temp_channels[SLOW_SIGNALS_NUM_CHANNELS];
+    if (slow_signals_read(temp_channels) == 0) {
+      memcpy(payload.channels, temp_channels, sizeof(temp_channels));
       payload.timestamp_ns = get_calibrated_timestamp_ns();
 
       // Enviar a la cola
@@ -465,11 +469,11 @@ int main(void) {
   fast_signals_init(spi0_mutex);
   printf("[MAIN] AD7606 listo.\n");
 
-  // 3. Inicializar hardware de adquisición lenta (AD4131 vía SPI0)
-  printf("[MAIN] Inicializando AD4131 (%d canales)...\n",
+  // 3. Inicializar hardware de adquisición lenta (AD7490 vía SPI0)
+  printf("[MAIN] Inicializando AD7490 (%d canales)...\n",
          SLOW_SIGNALS_NUM_CHANNELS);
   slow_signals_init(spi0_mutex);
-  printf("[MAIN] AD4131 listo.\n");
+  printf("[MAIN] AD7490 listo.\n");
 
   // 4. Inicializar enlace SPI (SPI1 como Slave)
   printf("[MAIN] Inicializando SPI Link Slave...\n");

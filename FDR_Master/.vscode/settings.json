@@ -1,9 +1,9 @@
-{
+﻿{
     "idf.flashType": "UART",
     "idf.portWin": "COM3",
     "idf.currentSetup": "C:/Esp32IDF/Espressif/frameworks/esp-idf-v5.5.1/",
     "clangd.arguments": [
-        "--query-driver=C:\\Esp32IDF\\Espressif\\tools\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
+        "--query-driver=C:\\Esp32IDF\\Espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
         "--header-insertion=never"
     ],
     "idf.openOcdConfigs": [
@@ -25,3 +25,4 @@
         ".vscode\\Pico-W-Stub"
     ]
 }
+
