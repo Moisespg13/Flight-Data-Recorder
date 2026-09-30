@@ -67,7 +67,10 @@ void led_init(void) {
     // Iniciar apagado (1 = OFF en active-low)
     SET_LED(false);
     
-    xTaskCreatePinnedToCore(tsk_led_indicator, "tsk_led", 2048, NULL, 5, NULL, 1);
+    // Sin afinidad: el LED es la única indicación de estado en la PCB y no
+    // debe quedar atado a la disponibilidad de un core en particular.
+    xTaskCreatePinnedToCore(tsk_led_indicator, "tsk_led", 2048, NULL, 5, NULL,
+                            tskNO_AFFINITY);
 }
 
 void led_set_mode(led_mode_t mode) {

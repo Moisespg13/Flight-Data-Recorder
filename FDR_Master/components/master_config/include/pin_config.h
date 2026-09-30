@@ -37,9 +37,12 @@
 // ============================================================================
 // GNSS (UART2 via GPIO Matrix)
 // ============================================================================
-#define PIN_GNSS_RX  35  // ESP32 RX <- GNSS TX
-#define PIN_GNSS_TX  36  // ESP32 TX -> GNSS RX
-#define PIN_PPS      37  // PPS del GNSS (Entrada)
+// El módulo de la PCB lleva PSRAM octal, que consume los GPIO 33-37 para la
+// interfaz de memoria aunque CONFIG_SPIRAM esté desactivado. Por eso el GNSS
+// no puede quedar en 35/36/37 como en el diseño original.
+#define PIN_GNSS_RX  17  // ESP32 RX <- GNSS TX
+#define PIN_GNSS_TX  16  // ESP32 TX -> GNSS RX
+#define PIN_PPS      15  // PPS del GNSS (Entrada)
 #define GNSS_UART_NUM 2
 
 // ============================================================================
@@ -65,3 +68,13 @@
 // LED INDICADOR
 // ============================================================================
 #define PIN_LED 0
+
+// ============================================================================
+// PINES NO DISPONIBLES (no reasignar)
+// ============================================================================
+//   GPIO 19, 20   : USB OTG D-/D+ (modo Descarga por pendrive)
+//   GPIO 26-32    : Flash SPI interna del módulo
+//   GPIO 33-37    : PSRAM octal del módulo
+//   GPIO 0, 45, 46: Strapping (0 y 46 en uso; 45 libre pero condicionado)
+//
+// Libres para uso futuro: 3, 6, 7, 8, 9, 14, 18, 21, 47, 48

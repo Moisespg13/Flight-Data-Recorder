@@ -240,84 +240,141 @@ def _decode_frame(words: list, frame_id: int, fmt: int, params: dict) -> None:
                 params[pname] = words[slot]
 
 
+class _ArrayTable:
+    """Vista liviana de los arrays. len() y el último ciclo, sin un dict por muestra."""
+
+    def __init__(self, arrays: dict):
+        self.arrays = arrays
+        self._n = int(len(arrays["tiempo_s"])) if "tiempo_s" in arrays else 0
+
+    def __len__(self):
+        return self._n
+
+    def __bool__(self):
+        return self._n > 0
+
+    def __getitem__(self, idx):
+        if isinstance(idx, int) and idx < 0:
+            idx = self._n + idx
+        row = {}
+        for key, col in self.arrays.items():
+            val = float(col[idx])
+            row[key] = None if np.isnan(val) else val
+        return row
+
+
+def _assign_subcomm(frames, word, table, cols):
+    """Último valor del ciclo gana, igual que el dict del parser anterior."""
+    n_frames = frames.shape[1]
+    for fid, name in enumerate(table):
+        if fid >= n_frames or name == "LIBRE":
+            continue
+        cols[name] = frames[:, fid, word]
+
+
+def _latlon_col(high, low):
+    h = high.astype(np.int64)
+    l = low.astype(np.int64) & 0xFFFF
+    raw = (h << 16) | l
+    raw = np.where(raw >= 0x80000000, raw - 0x100000000, raw)
+    out = raw.astype(np.float64) / 1_000_000.0
+    missing = np.isnan(high) | np.isnan(low)
+    out[missing] = np.nan
+    return out.astype(np.float32)
+
+
 def _parse_fdr_data(f, file_size, cev_format, data_offset, progress_cb=None):
-    """Lee el stream de datos a partir de data_offset y devuelve records."""
+    """Lee el .bin por bloques y devuelve columnas numpy, una por ciclo CEV."""
     if cev_format == 1:
         frames_per_cycle, words_per_frame, cycles_per_sec = 40, 17, 75
+        n_fast = 16
     elif cev_format == 2:
         frames_per_cycle, words_per_frame, cycles_per_sec = 40, 11, 75
+        n_fast = 9
     else:
-        frames_per_cycle, words_per_frame, cycles_per_sec = 10,  6, 10
+        frames_per_cycle, words_per_frame, cycles_per_sec = 10, 6, 10
+        n_fast = 0
 
-    frame_bytes  = words_per_frame * 2
-    frame_struct = struct.Struct(f"<{words_per_frame}h")
-    data_bytes   = file_size - data_offset
-    total_cycles_est = max(1, data_bytes // (frame_bytes * frames_per_cycle))
-
-    params   = {p: None for p in ANA_COLS + ["DIG"] + DSP_COLS + TIME_COLS +
-                ["LAT_H", "LAT_L", "LON_H", "LON_L", "ALT"]}
-    records  = []
-    frame_id = 0
-    cycle    = 0
-    n_fast   = 16 if cev_format == 1 else (9 if cev_format == 2 else 0)
-    fast_accum = {f"ANA_{i+1}": [] for i in range(n_fast)}
-    last_pct = -1
-
-    f.seek(data_offset)
-    while True:
-        raw = f.read(frame_bytes)
-        if len(raw) < frame_bytes:
-            break
-
-        words = list(frame_struct.unpack(raw))
-        for i in range(n_fast):
-            fast_accum[f"ANA_{i+1}"].append(words[i])
-        _decode_frame(words, frame_id, cev_format, params)
-
-        frame_id += 1
-        if frame_id >= frames_per_cycle:
-            frame_id = 0
-            cycle   += 1
-
-            rec = {"ciclo": cycle, "tiempo_s": round((cycle - 1) / cycles_per_sec, 4)}
-
-            for i in range(n_fast):
-                key = f"ANA_{i+1}"
-                buf = fast_accum[key]
-                rec[key] = round(sum(buf) / len(buf), 2) if buf else None
-                fast_accum[key] = []
-            for i in range(n_fast, 32):
-                rec[f"ANA_{i+1}"] = params.get(f"ANA_{i+1}")
-
-            dig_raw = params.get("DIG")
-            for i in range(16):
-                rec[f"DIG_{i+1}"] = ((dig_raw >> i) & 1) if dig_raw is not None else None
-
-                for key, scale in IMU_SCALES.items():
-                    v = params.get(key)
-                    rec[key] = round(v / scale, 4) if v is not None else None
-
-                for t in TIME_COLS:
-                    rec[t] = params.get(t)
-
-                # Reconstruir posición GPS
-                rec["LAT"] = _reconstruct_latlon(params.get("LAT_H"), params.get("LAT_L"))
-                rec["LON"] = _reconstruct_latlon(params.get("LON_H"), params.get("LON_L"))
-                alt_raw = params.get("ALT")
-                rec["ALT"] = round(alt_raw * 0.3048, 1) if alt_raw is not None else None  # ft → m
-
-                records.append(rec)
-
-            if progress_cb and cycle % 500 == 0:
-                pct = min(99, int(cycle * 100 / total_cycles_est))
-                if pct != last_pct:
-                    progress_cb(pct)
-                    last_pct = pct
+    data_bytes = file_size - data_offset
+    words_per_cycle = frames_per_cycle * words_per_frame
+    n_words = data_bytes // 2
+    n_cycles = n_words // words_per_cycle
+    if n_cycles < 1:
+        return {}
 
     if progress_cb:
-        progress_cb(100)
+        progress_cb(0, "Leyendo archivo… 0 MB")
 
-    return records
+    raw = np.empty(n_cycles * words_per_cycle, dtype="<i2")
+    f.seek(data_offset)
+    byte_total = n_cycles * words_per_cycle * 2
+    got = 0
+    view = raw.view(np.uint8)
+    chunk = 8 * 1024 * 1024
+    last_pct = -1
+    while got < byte_total:
+        n = f.readinto(view[got:got + chunk])
+        if not n:
+            break
+        got += n
+        if progress_cb:
+            pct = min(70, int(70 * got / byte_total))
+            if pct != last_pct:
+                mb = got / (1024 * 1024)
+                tot = byte_total / (1024 * 1024)
+                progress_cb(pct, f"Leyendo archivo… {mb:.0f} / {tot:.0f} MB")
+                last_pct = pct
+
+    if progress_cb:
+        progress_cb(75, "Armando canales…")
+
+    frames = raw.reshape(n_cycles, frames_per_cycle, words_per_frame)
+    cols = {}
+    if n_fast:
+        fast = frames[:, :, :n_fast].mean(axis=1)
+        for i in range(n_fast):
+            cols[f"ANA_{i+1}"] = fast[:, i]
+
+    if cev_format == 1:
+        _assign_subcomm(frames, 16, FMT1_WORD17, cols)
+    elif cev_format == 2:
+        _assign_subcomm(frames, 9, FMT2_WORD10, cols)
+        _assign_subcomm(frames, 10, FMT2_WORD11, cols)
+    else:
+        for slot in range(words_per_frame):
+            names = [row[slot] if slot < len(row) else "LIBRE" for row in FMT3_TABLE]
+            _assign_subcomm(frames, slot, names, cols)
+
+    for key, scale in IMU_SCALES.items():
+        if key in cols:
+            cols[key] = cols[key] / scale
+
+    arrays = {k: np.full(n_cycles, np.nan, dtype=np.float32) for k in CSV_COLUMNS}
+    arrays["ciclo"] = np.arange(1, n_cycles + 1, dtype=np.float32)
+    arrays["tiempo_s"] = np.arange(n_cycles, dtype=np.float32) / cycles_per_sec
+
+    for key, col in cols.items():
+        if key in ("LAT_H", "LAT_L", "LON_H", "LON_L"):
+            continue
+        if key == "ALT":
+            arrays["ALT"] = (col.astype(np.float32) * np.float32(0.3048))
+            continue
+        if key == "DIG":
+            dig = col.astype(np.int32)
+            for bit in range(16):
+                arrays[f"DIG_{bit+1}"] = ((dig >> bit) & 1).astype(np.float32)
+            continue
+        if key in arrays:
+            arrays[key] = col.astype(np.float32)
+
+    if "LAT_H" in cols and "LAT_L" in cols:
+        arrays["LAT"] = _latlon_col(cols["LAT_H"], cols["LAT_L"])
+    if "LON_H" in cols and "LON_L" in cols:
+        arrays["LON"] = _latlon_col(cols["LON_H"], cols["LON_L"])
+
+    if progress_cb:
+        progress_cb(100, f"Listo — {n_cycles:,} ciclos")
+    return arrays
 
 
 def parse_fdr_file(filepath: str, progress_cb=None, fallback_format: int = None):
@@ -355,9 +412,9 @@ def parse_fdr_file(filepath: str, progress_cb=None, fallback_format: int = None)
             cev_format = fallback_format
 
         data_offset = FDR_FILE_HEADER_SIZE if has_valid_header else 0
-        records = _parse_fdr_data(f, file_size, cev_format, data_offset, progress_cb)
+        arrays = _parse_fdr_data(f, file_size, cev_format, data_offset, progress_cb)
 
-    return cev_format, records
+    return cev_format, _ArrayTable(arrays)
 
 
 class _NoHeaderError(Exception):
@@ -365,7 +422,20 @@ class _NoHeaderError(Exception):
     pass
 
 
-def export_csv(records: list, output_path: str) -> None:
+def export_csv(records, output_path: str) -> None:
+    if isinstance(records, _ArrayTable):
+        keys = [k for k in CSV_COLUMNS if k in records.arrays]
+        n = len(records)
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(keys)
+            step = 20000
+            for start in range(0, n, step):
+                end = min(n, start + step)
+                block = np.column_stack([records.arrays[k][start:end] for k in keys])
+                for row in block:
+                    writer.writerow(["" if np.isnan(v) else v for v in row])
+        return
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
@@ -430,13 +500,19 @@ MAX_PLOT_POINTS = 6000   # puntos máximos por canal en los gráficos
 
 def _build_arrays(records: list) -> dict:
     """
-    Convierte la lista de dicts en un dict de numpy arrays para acceso rápido.
-    Permite decimación eficiente y evita list-comprehensions lentas al graficar.
+    Convierte la lista de dicts en un dict de numpy arrays (float32) para
+    acceso rápido. Una sola pasada; None → NaN.
     """
     if not records:
         return {}
-    keys = records[0].keys()
-    return {k: np.array([r.get(k) for r in records], dtype=float) for k in keys}
+    n = len(records)
+    keys = list(records[0].keys())
+    out = {k: np.empty(n, dtype=np.float32) for k in keys}
+    for i, r in enumerate(records):
+        for k in keys:
+            v = r.get(k)
+            out[k][i] = np.nan if v is None else v
+    return out
 
 
 def _decimate(arr: np.ndarray, step: int) -> np.ndarray:
@@ -537,10 +613,27 @@ class FDRConverterApp(tk.Tk):
         body = tk.Frame(self, bg=BG_DARK)
         body.pack(fill="both", expand=True, padx=12, pady=(8, 0))
 
-        # Sidebar izquierdo
-        left = tk.Frame(body, bg=BG_DARK, width=310)
-        left.pack(side="left", fill="y", padx=(0, 10))
-        left.pack_propagate(False)
+        # Sidebar izquierdo con scroll para pantallas chicas
+        left_container = tk.Frame(body, bg=BG_DARK, width=320)
+        left_container.pack(side="left", fill="y", padx=(0, 10))
+        left_container.pack_propagate(False)
+
+        canvas = tk.Canvas(left_container, bg=BG_DARK, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(left_container, orient="vertical", command=canvas.yview)
+        left = tk.Frame(canvas, bg=BG_DARK)
+
+        left.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=left, anchor="nw", width=305)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        left_container.bind("<Enter>", lambda _: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        left_container.bind("<Leave>", lambda _: canvas.unbind_all("<MouseWheel>"))
+
         self._build_device_panel(left)
         self._build_file_panel(left)
         self._build_actions_panel(left)
@@ -584,7 +677,8 @@ class FDRConverterApp(tk.Tk):
         bar = tk.Frame(self, bg=BG_PANEL, height=34)
         bar.pack(fill="x", side="bottom")
         ttk.Progressbar(bar, variable=self._progress, maximum=100,
-                        style="Horizontal.TProgressbar", length=180).pack(side="left", padx=12, pady=7)
+                        style="Horizontal.TProgressbar", length=320).pack(
+                            side="left", padx=12, pady=7, fill="x")
         tk.Label(bar, textvariable=self._status_text,
                  bg=BG_PANEL, fg=FG_MUTED, font=("Segoe UI", 9)).pack(side="left")
 
@@ -659,10 +753,12 @@ class FDRConverterApp(tk.Tk):
                    command=self._open_cal_dialog).pack(fill="x", padx=10, pady=(0, 6))
         ttk.Button(card, text="🖼  Exportar gráfico activo",
                    command=self._export_current_plot).pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Button(card, text="📄  Generar reporte PDF",
-                   command=self._generate_report).pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Button(card, text="🗑  Formatear SD  (RS-232)",
-                   command=self._format_sd_dialog).pack(fill="x", padx=10, pady=(0, 6))
+        row_btns = tk.Frame(card, bg=BG_CARD)
+        row_btns.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(row_btns, text="📄  Reporte PDF",
+                   command=self._generate_report).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(row_btns, text="🗑  Formatear SD",
+                   command=self._format_sd_dialog).pack(side="left", fill="x", expand=True, padx=(3, 0))
         cal_row = tk.Frame(card, bg=BG_CARD)
         cal_row.pack(fill="x", padx=10, pady=(0, 10))
         tk.Checkbutton(cal_row, text="Mostrar valores calibrados",
@@ -793,6 +889,7 @@ class FDRConverterApp(tk.Tk):
 
         self._set_status("Leyendo archivo…", 0)
         self._records    = None
+        self._arrays     = None
         self._cev_format = None
 
         def run():
@@ -800,7 +897,8 @@ class FDRConverterApp(tk.Tk):
                 fmt, recs = parse_fdr_file(bin_path,
                                            progress_cb=self._ui_progress,
                                            fallback_format=fallback_format)
-                self.after(0, lambda: self._on_done(fmt, recs, bin_path))
+                self.after(0, lambda: self._on_done(
+                    fmt, recs, bin_path, recs.arrays))
             except _NoHeaderError as exc:
                 self.after(0, lambda e=exc: self._ask_format_then_convert(bin_path, str(e)))
             except Exception as exc:
@@ -860,22 +958,20 @@ class FDRConverterApp(tk.Tk):
         ttk.Button(btn_row, text="Cancelar",
                    command=on_cancel).pack(side="left", padx=6)
 
-    def _ui_progress(self, pct: int):
-        self.after(0, lambda p=pct: (self._progress.set(p),
-                                     self._status_text.set(f"Procesando… {p}%")))
+    def _ui_progress(self, pct: int, msg: str | None = None):
+        text = msg or f"Procesando… {pct}%"
+        self.after(0, lambda p=pct, t=text: (
+            self._progress.set(p), self._status_text.set(t)))
 
     def _set_status(self, msg: str, pct: int | None = None):
         self._status_text.set(msg)
         if pct is not None:
             self._progress.set(pct)
 
-    def _on_done(self, fmt, records, bin_path):
+    def _on_done(self, fmt, records, bin_path, arrays=None):
         self._cev_format = fmt
         self._records    = records
-
-        # Construir arrays numpy una sola vez (reutilizados en todos los gráficos)
-        self._set_status("Construyendo arrays…", 100)
-        self._arrays = _build_arrays(records)
+        self._arrays     = arrays if arrays is not None else _build_arrays(records)
 
         fmt_names = {
             1: "Formato 1  (40×17 words, 3000 fr/s)",
@@ -895,16 +991,34 @@ class FDRConverterApp(tk.Tk):
         )
         self._info_label.config(text=info, fg=GREEN)
 
-        if self._csv_path.get().strip():
+        if self._csv_path.get().strip() and size_mb <= 40:
             self._save_csv(silent=True)
 
+        extra = ""
+        if size_mb > 40:
+            extra = "  CSV no se generó solo: usá Guardar CSV."
         self._set_status(
-            f"OK — {len(records):,} ciclos  ({dur_s:.0f} s de vuelo)", 100
+            f"OK — {len(records):,} ciclos  ({dur_s:.0f} s). Graficando…{extra}", 90
         )
-        self._draw_plots(records, fmt)
-        self._setup_individual_tab(records, fmt)
-        self._setup_psd_tab(records, fmt)
-        self._draw_gps_tab(records)
+        # Diferir gráficos: evita congelar la UI justo al terminar el parse.
+        self.after(20, lambda: self._draw_after_load(fmt))
+
+    def _draw_after_load(self, fmt):
+        records = self._records
+        if not records:
+            return
+        try:
+            self._draw_plots(records, fmt)
+            self._setup_individual_tab(records, fmt)
+            self._setup_psd_tab(records, fmt)
+            self._draw_gps_tab(records)
+            cps = {1: 75, 2: 75, 3: 10}[fmt]
+            dur_s = len(records) / cps
+            self._set_status(
+                f"OK — {len(records):,} ciclos  ({dur_s:.0f} s de vuelo)", 100
+            )
+        except Exception as exc:
+            self._on_error(exc)
 
     def _on_error(self, exc):
         self._set_status(f"Error: {exc}", 0)
@@ -963,16 +1077,14 @@ class FDRConverterApp(tk.Tk):
                 return
             self._csv_path.set(csv_path)
         try:
-            if self._cal_mode.get() and self._cal_data:
-                # Exportar con valores calibrados
-                cal_records = []
-                for r in self._records:
-                    row = dict(r)
-                    for key, c in self._cal_data.items():
-                        if key in row and row[key] is not None and c.get("coeffs"):
-                            row[key] = float(np.polyval(c["coeffs"], row[key]))
-                    cal_records.append(row)
-                export_csv(cal_records, csv_path)
+            if self._cal_mode.get() and self._cal_data and isinstance(self._records, _ArrayTable):
+                calibrated = _ArrayTable({k: v.copy() for k, v in self._records.arrays.items()})
+                for key, c in self._cal_data.items():
+                    if key in calibrated.arrays and c.get("coeffs"):
+                        col = calibrated.arrays[key]
+                        good = ~np.isnan(col)
+                        col[good] = np.polyval(c["coeffs"], col[good]).astype(np.float32)
+                export_csv(calibrated, csv_path)
                 self._set_status(f"CSV calibrado guardado: {Path(csv_path).name}", 100)
             else:
                 export_csv(self._records, csv_path)
@@ -1171,6 +1283,7 @@ class FDRConverterApp(tk.Tk):
 
         self._mon_running = False
         self._mon_serial  = None
+        self._mon_io_lock = threading.Lock()
         self._mon_values: dict = {}    # {channel_idx: int16}
 
         # ── Barra de control ──
@@ -1390,17 +1503,22 @@ class FDRConverterApp(tk.Tk):
             t_start = time.monotonic()
             values  = {}
             error   = None
-
-            for _, ch, _ in self._mon_rows:
-                if not self._mon_running:
-                    return
-                try:
-                    raw = self._mon_query_channel(ch)
-                    if raw is not None:
-                        values[ch] = raw
-                except Exception as exc:
-                    error = str(exc)
-                    break
+            if not self._mon_io_lock.acquire(timeout=0.05):
+                time.sleep(0.02)
+                continue
+            try:
+                for _, ch, _ in self._mon_rows:
+                    if not self._mon_running:
+                        return
+                    try:
+                        raw = self._mon_query_channel(ch)
+                        if raw is not None:
+                            values[ch] = raw
+                    except Exception as exc:
+                        error = str(exc)
+                        break
+            finally:
+                self._mon_io_lock.release()
 
             self.after(0, lambda v=values, e=error: self._mon_update_table(v, e))
 
@@ -1587,6 +1705,7 @@ class FDRConverterApp(tk.Tk):
                     ser.open()
 
                     try:
+                        _time.sleep(2.5)
                         ser.reset_input_buffer()
                         ser.write(msg)
                         # El ACK llega recién cuando termina de formatear.
@@ -2213,6 +2332,209 @@ class FDRConverterApp(tk.Tk):
             self._set_status("Error al generar reporte.", 0)
             messagebox.showerror("Error al generar reporte", str(exc))
 
+    _CEV_FORMAT_CHOICES = {
+        1: "F1  —  3 000 fr/s  (75 ciclos/s)   40×17 words",
+        2: "F2  —  3 000 fr/s  (75 ciclos/s)   40×11 words",
+        3: "F3  —  100 fr/s   (10 ciclos/s)   10×6 words",
+    }
+
+    def _selected_cev_format(self) -> int:
+        text = self._bitrate_var.get() if hasattr(self, "_bitrate_var") else ""
+        if text.startswith("F2"):
+            return 2
+        if text.startswith("F3"):
+            return 3
+        return 1
+
+    def _pick_cmd_port(self):
+        """Pide el COM si el monitor RS-232 no está conectado."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Puerto de comandos")
+        dlg.configure(bg=BG_PANEL)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ports = ["COM1"]
+        try:
+            import serial.tools.list_ports
+            detected = [p.device for p in serial.tools.list_ports.comports()]
+            if detected:
+                ports = detected
+        except Exception:
+            pass
+        preset = self._mon_port.get() if hasattr(self, "_mon_port") else ports[0]
+        if preset not in ports:
+            ports = [preset] + ports
+
+        tk.Label(dlg, text="El monitor no está conectado.\nElegí el COM del UART de comandos.",
+                 bg=BG_PANEL, fg=FG_TEXT, font=("Segoe UI", 9),
+                 justify="left").pack(anchor="w", padx=14, pady=(12, 6))
+        port_var = tk.StringVar(value=preset if preset in ports else ports[0])
+        ttk.Combobox(dlg, textvariable=port_var, values=ports,
+                     state="readonly", width=16).pack(padx=14, pady=(0, 10))
+        chosen = {"port": None}
+
+        def _ok():
+            chosen["port"] = port_var.get().strip()
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        row = tk.Frame(dlg, bg=BG_PANEL)
+        row.pack(pady=(0, 12))
+        ttk.Button(row, text="Usar este puerto", command=_ok).pack(side="left", padx=4)
+        ttk.Button(row, text="Cancelar", command=_cancel).pack(side="left", padx=4)
+        dlg.wait_window()
+        if not chosen["port"]:
+            return None
+        return chosen["port"], 115200
+
+    def _cmd_port_for_format(self):
+        """Puerto ya abierto del monitor, o uno elegido en el hilo de la UI."""
+        if getattr(self, "_mon_running", False) and self._mon_serial is not None:
+            return self._mon_serial.port, self._mon_serial.baudrate, True
+        picked = self._pick_cmd_port()
+        if picked is None:
+            return None
+        port, baud = picked
+        return port, baud, False
+
+    def _cmd_transact(self, command: int, data: int, port: str, baud: int, pause_monitor: bool):
+        """
+        Envía un mensaje de 6 bytes (header 0xAA55, comando, dato) y espera
+        la respuesta del mismo comando. Devuelve el dato de la respuesta,
+        o None si no hubo trama válida.
+        """
+        import time
+        import serial
+        import struct
+
+        own_port = None
+        held = False
+        try:
+            if pause_monitor and self._mon_serial is not None:
+                self._mon_io_lock.acquire()
+                held = True
+                ser = self._mon_serial
+            else:
+                ser = serial.Serial()
+                ser.port = port
+                ser.baudrate = baud
+                ser.timeout = 0.05
+                # DTR/RTS en alto resetean el DevKit. El monitor y el formateo
+                # ya los dejan en bajo; esta apertura tiene que hacer lo mismo.
+                ser.dtr = False
+                ser.rts = False
+                ser.open()
+                own_port = ser
+                time.sleep(0.05)
+
+            ser.reset_input_buffer()
+            ser.write(struct.pack("<HHH", 0xAA55, command, data & 0xFFFF))
+            deadline = time.monotonic() + 0.8
+            buf = bytearray()
+            while time.monotonic() < deadline:
+                n = ser.in_waiting
+                if n:
+                    buf.extend(ser.read(n))
+                else:
+                    time.sleep(0.01)
+                pos = 0
+                while True:
+                    found = buf.find(b"\x55\xAA", pos)
+                    if found < 0 or found + 6 > len(buf):
+                        break
+                    hdr, cmd, val = struct.unpack("<HHH", bytes(buf[found:found + 6]))
+                    if hdr == 0xAA55 and cmd == command:
+                        return val
+                    pos = found + 2
+            return None
+        finally:
+            if own_port is not None and own_port.is_open:
+                own_port.close()
+            if held:
+                self._mon_io_lock.release()
+
+    def _set_fdr_format_status(self, text: str, color: str):
+        if hasattr(self, "_fdr_fmt_status"):
+            self._fdr_fmt_status.config(text=text, fg=color)
+
+    def _read_fdr_format(self):
+        target = self._cmd_port_for_format()
+        if target is None:
+            return
+        port, baud, pause_monitor = target
+
+        def work():
+            try:
+                val = self._cmd_transact(0x0003, 0, port, baud, pause_monitor)
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror(
+                    "Leer formato", f"No se pudo hablar con el FDR:\n{exc}"))
+                return
+            def show():
+                if val in (1, 2, 3):
+                    self._bitrate_var.set(self._CEV_FORMAT_CHOICES[val])
+                    self._set_fdr_format_status(
+                        f"Formato activo en el FDR: {val}", GREEN)
+                elif val is None:
+                    self._set_fdr_format_status(
+                        "Formato activo en el FDR: sin respuesta", RED)
+                    messagebox.showwarning(
+                        "Leer formato",
+                        "El FDR no respondió al comando 3.\n"
+                        "Revisá el puerto COM y que el equipo esté encendido.")
+                else:
+                    self._set_fdr_format_status(
+                        "Formato activo en el FDR: error", RED)
+                    messagebox.showerror(
+                        "Leer formato",
+                        f"El FDR respondió un valor inválido: {val}.")
+            self.after(0, show)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _write_fdr_format(self):
+        fmt = self._selected_cev_format()
+        if not messagebox.askyesno(
+            "Guardar formato",
+            f"¿Guardar el formato {fmt} en el FDR?\n\n"
+            "Queda en la memoria no volátil. La grabación en curso no cambia: "
+            "reiniciá el equipo y después empezá el vuelo."):
+            return
+        target = self._cmd_port_for_format()
+        if target is None:
+            return
+        port, baud, pause_monitor = target
+
+        def work():
+            try:
+                val = self._cmd_transact(0x0002, fmt, port, baud, pause_monitor)
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror(
+                    "Guardar formato", f"No se pudo hablar con el FDR:\n{exc}"))
+                return
+            def show():
+                if val == 0x0001:
+                    self._set_fdr_format_status(
+                        f"Formato guardado en el FDR: {fmt}  (reiniciar para usarlo)",
+                        GREEN)
+                    messagebox.showinfo(
+                        "Formato guardado",
+                        f"El formato {fmt} quedó guardado.\n\n"
+                        "Reiniciá el FDR antes de grabar. El archivo de la "
+                        "grabación que ya está abierta sigue en el formato anterior.")
+                else:
+                    self._set_fdr_format_status(
+                        "Formato activo en el FDR: no se pudo guardar", RED)
+                    messagebox.showerror(
+                        "Guardar formato",
+                        "El FDR no confirmó el cambio. "
+                        "Tiene que responder ACK al comando 2.")
+            self.after(0, show)
+        threading.Thread(target=work, daemon=True).start()
+
     # ──────────────────────────────────────────────────────────────────
     # ⚙  Pestaña Configuración / Calibración LSQ
     # ──────────────────────────────────────────────────────────────────
@@ -2259,6 +2581,20 @@ class FDRConverterApp(tk.Tk):
                                     "F3  —  100 fr/s   (10 ciclos/s)   10×6 words",
                                 ])
         br_combo.pack(side="left", pady=8, padx=(0, 10))
+
+        fmt_row = tk.Frame(parent, bg=BG_CARD)
+        fmt_row.pack(fill="x", padx=12, pady=(0, 8))
+        self._fdr_fmt_status = tk.Label(
+            fmt_row, text="Formato activo en el FDR: —",
+            bg=BG_CARD, fg=FG_TEXT, font=("Segoe UI", 9))
+        self._fdr_fmt_status.pack(side="left", padx=(10, 8), pady=6)
+        ttk.Button(fmt_row, text="Leer del FDR",
+                   command=self._read_fdr_format).pack(side="left", padx=(0, 6), pady=6)
+        ttk.Button(fmt_row, text="Guardar en el FDR",
+                   command=self._write_fdr_format).pack(side="left", pady=6)
+        tk.Label(fmt_row, text="Se aplica al reiniciar el FDR, antes de grabar.",
+                 bg=BG_CARD, fg=FG_MUTED, font=("Segoe UI", 8, "italic")).pack(
+                     side="left", padx=(10, 6))
 
         # Tabla de canales
         hdr = tk.Frame(parent, bg=BG_DARK)
@@ -3396,7 +3732,8 @@ class FDRConverterApp(tk.Tk):
         for i in range(1, 17):
             ax = fig_dig.add_subplot(4, 4, i, facecolor=BG_PANEL)
             v  = _decimate(arrs.get(f"DIG_{i}", np.array([])), step)
-            ax.fill_between(t, v, step="post", color=ACCENT, alpha=0.7)
+            if len(v):
+                ax.plot(t, v, lw=0.9, color=ACCENT, drawstyle="steps-post")
             ax.set_ylim(-0.1, 1.2)
             ax.set_yticks([0, 1])
             ax.set_yticklabels(["0", "1"], fontsize=6, color=FG_MUTED)

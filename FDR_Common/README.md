@@ -11,5 +11,5 @@ Estos headers definen el **protocolo de comunicación SPI** y utilidades comunes
 
 | Archivo       | Descripción                                          |
 | ------------- | ---------------------------------------------------- |
-| `protocol.h`  | Estructuras de paquetes, tipos y payloads            |
+| `protocol.h`  | Paquetes SPI (header + CRC32). Los rápidos viajan de a 4 muestras (178 bytes); cada una conserva su timestamp |
 | `crc_utils.h` | Función CRC32 portable (tabla por software)          |

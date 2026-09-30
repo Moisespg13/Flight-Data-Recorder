@@ -1,320 +1,110 @@
 # Flight Data Recorder (FDR) - Firmware
 
-Repositorio del firmware para el **Registrador de Datos de Vuelo (FDR)**, un sistema diseñado para ensayos en vuelo del Centro de Ensayos en Vuelo (CEV-FAA) y desarrollado en el Instituto Universitario Aeronáutico (IUA).
+Firmware del registrador de datos de vuelo (FDR) para ensayos del Centro de Ensayos en Vuelo (CEV-FAA), desarrollado en el Instituto Universitario Aeronáutico (IUA).
 
-## Descripción General
+El detalle de pines, protocolo, tareas y formatos está en [`DocumentacionDeContexto/fdr_system_architecture.md`](DocumentacionDeContexto/fdr_system_architecture.md).
 
-El sistema FDR está basado en la utilización de dos microcontroladores bajo un entorno de tiempo real (FreeRTOS): un **ESP32-S3** como placa maestra y un **RP2040-Zero** (Waveshare) como placa esclava de adquisición. El hardware está dividido físicamente en dos placas que se comunican mediante un bus SPI dedicado.
+## Descripción
 
-El Esclavo adquiere 32 canales analógicos mediante conversores ADC dedicados, empaqueta los datos con timestamps disciplinados por GPS y los transmite al Maestro. El Maestro recibe estos datos, los combina con señales locales (GNSS, IMU, discretas), ensambla frames en el formato estándar CEV y los persiste en una tarjeta MicroSD.
+Dos microcontroladores bajo FreeRTOS:
 
-> **Nota sobre el cambio de arquitectura:** Originalmente el sistema empleaba dos ESP32-S3 idénticos. Se decidió reemplazar la placa esclava por una **Raspberry Pi RP2040-Zero** de Waveshare debido a especificaciones físicas del hardware (menor tamaño). Esto implicó dividir el proyecto en tres subcarpetas independientes y portar el firmware del esclavo al Pico SDK con FreeRTOS.
+- **Maestro, ESP32-S3** (ESP-IDF v5.5). Recibe los analógicos del esclavo, los junta con GNSS, IMU Xsens y 16 discretas (expansor I2C **TCA9555**), arma tramas CEV (formatos 1, 2 o 3) y las graba en dos MicroSD.
+- **Esclavo, RP2040-Zero** (Pico SDK 2.2 + FreeRTOS SMP). Muestrea 16 canales rápidos con 2× AD7606 a 3 kHz y 16 lentos con 1× AD7490 a ~20 Hz. Los transmite por un esclavo SPI hecho en PIO: el SPI de hardware del RP2040 desplaza bits en modo esclavo.
 
----
+El esclavo arranca a muestrear con el primer flanco de bajada de CS del enlace. No hay cable `SYNC_TRIG`.
 
-## Arquitectura de Hardware
+Al encender, si hay un pendrive el maestro copia `FDR_*.bin` (modo descarga, USB Host MSC). Si no hay pendrive, entra en modo vuelo. Un flanco de bajada en GPIO 46 cierra el archivo ante una caída de alimentación.
 
-El hardware se particiona funcionalmente en dos tarjetas principales:
+## Dos árboles
 
-### Placa A — MainBoard / Maestra (ESP32-S3)
+| Carpeta | Para qué es |
+|---------|-------------|
+| `FDR/` (este árbol) | Firmware de la PCB |
+| `FDR_TB/` | Protoboard: 2 módulos de SD y señales simuladas. Es el firmware más nuevo |
 
-Encargada del procesamiento principal, almacenamiento, sincronización y comunicaciones. Framework: **ESP-IDF v5.5**.
+`FDR_TB` ya comparte con este árbol el paquete rápido de **4** muestras y el `fsync` desfasado (SD1 a los 2, 4 y 6 minutos; SD2 a los 3, 5 y 7).
 
-| Subsistema | Interfaz | Detalle |
-|------------|----------|---------|
-| Enlace SPI con Esclavo | SPI2 Master (10 MHz) | MOSI=11, MISO=13, CLK=12, CS=10, DRDY=45 |
-| MicroSD | SDMMC 1-bit (40 MHz) | CMD=38, CLK=39, D0=40 |
-| GNSS | UART2 (9600 baud) | RX=35, TX=36, PPS=37 |
-| IMU Xsens | UART0 (115200 baud) | RX=44, TX=43 |
-| Puerto de Comandos RS-232 | UART1 (115200 baud) | RX=41, TX=42 (vía MAX3232E) |
-| Entradas Discretas | Expansor I2C TCA9555 | Lectura digital por bus I2C |
-| Señal de Sincronización | GPIO 9 | SYNC_TRIG → Esclavo (flanco de subida) |
-| Detección de Power-Loss | GPIO 46 | Comparador externo (~22V umbral) |
-| USB Host (Pendrive) | USB-OTG interno | Descarga de archivos a pendrive |
+Lo que ya está en los dos: PSRAM octal de 8 MB a 40 MHz, anillo de grabación de 2 MB en esa memoria, GNSS en GPIO 17/16/15 (los GPIO 33–37 los usa la PSRAM) y el ensamblado CEV en el núcleo 1, separado de la escritura a SD en el núcleo 0. La protoboard no lee el TCA9555 porque ese integrado no está en el banco: la tarea de discretas inyecta un patrón simulado. El diseño de las discretas sigue siendo el TCA9555 en el maestro.
 
-### Placa B — InputsBoard / Esclava (RP2040-Zero)
+## Hardware de esta PCB
 
-Co-procesador dedicado a la adquisición analógica de alta velocidad. Framework: **Pico SDK 2.2 + FreeRTOS SMP**.
+| Subsistema | Interfaz | Pines |
+|------------|----------|-------|
+| Enlace con el esclavo | SPI2 master, 10 MHz, DRDY por interrupción | MISO 13, CLK 12, CS 10, DRDY 11 |
+| MicroSD ×2 | SPI3, 20 MHz, MISO compartido | MOSI 38, CLK 39, MISO 40, CS1 1, CS2 2 |
+| GNSS | UART2, 9600 baud, NMEA. PSRAM octal en GPIO 33–37 | RX 17, TX 16, PPS 15 |
+| IMU Xsens | UART0, 115200 baud | RX 44, TX 43 |
+| Comandos | UART1, 115200 baud, MAX3232 | RX 41, TX 42 |
+| Discretas | I2C TCA9555 `0x20`, 400 kHz, debounce de 3 muestras | SCL 4, SDA 5 |
+| Power-loss | GPIO, flanco de bajada | 46 |
+| USB Host | OTG, pendrive MSC | GPIO 19 / 20 |
 
-| Subsistema | Interfaz | Detalle |
-|------------|----------|---------|
-| ADC Rápido (16 ch) | SPI0 Master (10 MHz) | 2× AD7606, 16-bit SAR, muestreo simultáneo ≥ 3 kSPS |
-| ADC Lento (16 ch) | SPI0 Master (compartido) | 1x AD7490, 12-bit SAR, ~20 Hz |
-| Enlace SPI con Maestro | PIO SPI Slave + DMA | GP1=MISO, GP2=SCK, GP0=CS, GP8=DRDY |
-| Sincronización | GP14 | SYNC_TRIG ← Maestro |
-| Disciplina de Reloj | GP26 | PPS ← GPS (< 4 µs de error) |
+### Esclavo
 
-> **¿Por qué PIO en lugar de SPI hardware?** El periférico PL022 del RP2040 tiene un bug documentado que provoca desplazamientos de bits en modo esclavo. Se implementó un esclavo SPI por PIO (Programmable I/O) que emula el protocolo bit a bit con sincronismo de fase perfecto.
+| Subsistema | Interfaz | Pines |
+|------------|----------|-------|
+| AD7606 ×2 | SPI0 master, modo 2, mutex compartido | MISO GP4, SCK GP6, MOSI GP7, CS GP5 y GP27, CONVST GP10, BUSY GP12 y GP28, RST GP15 |
+| AD7490 | SPI0, modo 3 (el driver cambia el modo del bus y lo restaura) | CS GP9 |
+| Enlace PIO | SPI modo 0, DMA | CS GP0, MISO GP1, SCK GP2, DRDY GP3 |
+| PPS | GPIO, flanco de subida | GP26 |
 
----
+## Tareas
 
-## Arquitectura de Software
+Maestro: `tsk_spi_link_master` (prioridad 12, núcleo 1), ensamblado CEV (9, núcleo 1), escritura a SD (6, núcleo 0), time sync (7), procesado rápido y lento (5, núcleo 1), discretas, IMU (5), comandos (4), supervisor (3). El anillo de 2 MB está en la PSRAM; las pilas de las tareas quedan en la SRAM interna.
 
-El firmware está modularizado y gestionado por tareas concurrentes bajo FreeRTOS en ambas placas para garantizar robustez, tiempos determinísticos y una latencia estricta menor a 2 ms desde la captura hasta el encolado.
+Esclavo (6): coordinador (8, se destruye al ver el primer CS), adquisición rápida (7, timer de 333 µs), lenta (6, 50 ms), enlace SPI (6), time sync (6), watchdog de hardware (1, timeout 2 s).
 
-> **Nota:** El repositorio incluye además un entorno de Testbench (`FDR_TB/`) con versiones espejadas del Maestro y el Esclavo, utilizadas para validación funcional con datos simulados antes de desplegar en el hardware de vuelo.
+## Protocolo inter-placa
 
-### Estructura del Proyecto
+Cabecera: magic `0xFD`, tipo, secuencia (2 B), timestamp en ns (8 B), largo (2 B). Después el payload y un CRC32 (IEEE 802.3). Tipo `0x01` = rápidos, `0x02` = lentos.
 
-Al tratarse de dos plataformas distintas (ESP-IDF y Pico SDK), el proyecto se divide en tres subcarpetas:
+Cada paquete rápido lleva cuatro muestras (178 bytes). La cabecera usa el timestamp de la primera y cada muestra conserva el suyo. El paquete lento sigue siendo una muestra (58 bytes).
+
+## Formatos CEV
+
+| Formato | Frames/ciclo | Words/frame | Frames/s |
+|:-------:|:------------:|:-----------:|:--------:|
+| F1 | 40 | 17 | 3000 |
+| F2 | 40 | 11 | 3000 |
+| F3 | 10 | 6 | 100 |
+
+El yaw de la IMU se guarda como **DSP 13** (una celda que en la planilla CEV estaba libre). DSP 12 es el sincronismo PPS. El formato activo vive en NVS y se cambia por el puerto de comandos (mensajes de 6 bytes, header `0xAA55`; el formateo de SD pide la clave `0x55AA`). El FDR Converter puede leerlo y guardarlo; el valor se aplica al reiniciar.
+
+Cada `FDR_XXXX.bin` abre con 12 bytes: magic `0xFD464452`, versión, formato y CRC32 de esos primeros 8 bytes. Siguen las tramas `int16` sin separadores.
+
+## Estructura
 
 ```
 FDR/
-├── FDR_Common/                  # Headers compartidos entre ambas placas
-│   ├── protocol.h               #   Protocolo inter-placa (Header + CRC32)
-│   └── crc_utils.h              #   Tabla CRC32 (IEEE 802.3)
-│
-├── FDR_Master/                  # Firmware Maestro (ESP32-S3 / ESP-IDF)
-│   ├── main/
-│   │   └── FDR_Master.c         #   Punto de entrada, detección de modo
-│   └── components/
-│       ├── master_config/       #   Configuración centralizada de pines
-│       ├── master_logic/        #   Orquestador: inicialización + 8 tareas
-│       ├── spi_link/            #   Enlace SPI con el Esclavo (Master)
-│       ├── sample_format/       #   Ensamblador de frames CEV (3 formatos)
-│       ├── sd_storage/          #   Almacenamiento buffereado en MicroSD
-│       ├── gnss/                #   Driver GNSS (NMEA + PPS)
-│       ├── imu_xsens/           #   Driver IMU Xsens (protocolo MT)
-│       ├── discrete_signals/    #   Lectura de 16 entradas digitales
-│       ├── cmd_port/            #   Puerto de comandos RS-232
-│       ├── supervisor/          #   Watchdog de software
-│       └── usb_transfer/        #   USB Host MSC (copia a pendrive)
-│
-├── FDR_Slave/                   # Firmware Esclavo (RP2040 / Pico SDK)
-│   ├── src/
-│   │   ├── main.c               #   Entrada, 5 tareas, coordinator pattern
-│   │   ├── fast_signals.c       #   Driver AD7606 ×2 (16 canales rápidos)
-│   │   ├── slow_signals.c       #   Driver AD7490 (16 canales lentos)
-│   │   ├── spi_link_slave.c     #   Enlace SPI PIO (Slave TX)
-│   │   └── spi_slave_tx.pio     #   Máquina de estados PIO (3 instrucciones)
-│   ├── include/
-│   │   ├── pin_config.h         #   Mapa de pines del RP2040
-│   │   ├── fast_signals.h       #   API del AD7606
-│   │   ├── slow_signals.h       #   API del AD7490
-│   │   ├── spi_link_slave.h     #   API del enlace SPI
-│   │   └── FreeRTOSConfig.h     #   Configuración FreeRTOS SMP dual-core
-│   └── lib/
-│       └── FreeRTOS-Kernel/     #   Kernel FreeRTOS (submodule de Git)
-│
-├── FDR_Converter/               # Herramienta de post-proceso (Python)
-│   ├── fdr_converter.py         #   Conversor .bin → CSV + visualizador
-│   └── requirements.txt         #   Dependencias (matplotlib, numpy)
-│
-└── FDR.code-workspace           # Workspace de VS Code multi-carpeta
+??? FDR_Common/            # protocol.h, crc_utils.h
+??? FDR_Master/            # ESP-IDF
+?   ??? components/        # master_logic, spi_link, sample_format, sd_storage,
+?                          # gnss, imu_xsens, discrete_signals, cmd_port,
+?                          # supervisor, usb_transfer, master_config
+??? FDR_Slave/             # Pico SDK
+?   ??? src/               # main.c, fast_signals.c, slow_signals.c, spi_link_slave.c
+??? FDR_Converter/         # .bin ? CSV + gráficos
+??? DocumentacionDeContexto/
 ```
 
----
-
-### Componentes del Maestro (ESP32-S3)
-
-| Componente | Descripción |
-|------------|-------------|
-| `master_config` | Archivo centralizado de asignación de pines (`pin_config.h`) y estructuras del protocolo. |
-| `master_logic` | Orquestador principal. Ejecuta la secuencia de inicialización y crea las 8 tareas de vuelo. Contiene la ISR de power-loss. |
-| `spi_link` | Recibe paquetes del Esclavo por SPI2. Protocolo de handshake DRDY por polling: espera DRDY HIGH → ejecuta transacción DMA @ 8 MHz → espera DRDY LOW. Valida Magic Byte + CRC32 y enruta a las colas `q_rx_fast` o `q_rx_slow`. Throughput verificado: >2800 pkts/s con 100% hit rate. |
-| `sample_format` | Ensamblador de frames CEV. Mantiene un buffer compartido de 53 parámetros (incluyendo DSP_13 = Yaw) y aplica tablas de sub-conmutación para construir los frames de 16-bit words según el formato activo (F1, F2 o F3). |
-| `sd_storage` | Almacenamiento en MicroSD vía SDMMC. Buffer de escritura de 4 KB, fsync periódico, header de archivo de 12 bytes con autodetección de formato. Verificación de espacio libre al inicio y aborto controlado si la SD se llena (genera archivo `.ERR`). |
-| `gnss` | Driver GNSS por UART. Parsea NMEA ($GPRMC + $GPGGA), captura PPS por ISR, mantiene reloj UTC calibrado. Provee fecha/hora, posición (Lat/Lon/Alt) y calidad del fix al ensamblador CEV. |
-| `imu_xsens` | Driver para IMU Xsens MTi por UART. Parsea el protocolo binario MT, extrae los 12 parámetros completos (aceleración, giróscopo, magnetómetro, roll, pitch, **yaw**) y los escala a int16. |
-| `discrete_signals` | Lee 16 entradas mediante el expansor I2C TCA9555 con **debouncing por software** (N muestras consecutivas) y los empaqueta en un bitmap de 16 bits. |
-| `cmd_port` | Puerto RS-232 (115200 baud) para la notebook de mantenimiento. Protocolo de 6 bytes para leer canales, configurar el formato CEV en NVS y formatear la MicroSD (con clave de seguridad). |
-| `supervisor` | Watchdog de software. Cada tarea hace check-in periódico; si alguna excede su timeout, se registra una alarma. |
-| `usb_transfer` | USB Host MSC. Solo activo en Modo Descarga: copia archivos `FDR_*.bin` de la SD a un pendrive. |
-
-### Módulos del Esclavo (RP2040)
-
-| Módulo | Descripción |
-|--------|-------------|
-| `fast_signals` | Driver para 2× AD7606 (16 canales de 16-bit, muestreo simultáneo a 3 kHz). Usa SPI0 con mutex compartido. Disparo de conversión por pulso CONVST. |
-| `slow_signals` | Driver para 1x AD7490 (16 canales de 12-bit, ~20 Hz). Comparte SPI0 con el driver r�pido. |
-| `spi_link_slave` | Empaqueta payloads con header + CRC32 y los transmite por **PIO + DMA de 32-bit** al Maestro, señalizando con DRDY. El canal DMA alimenta automáticamente el FIFO del PIO sin intervención de la CPU. |
-| `spi_slave_tx.pio` | Máquina de estados PIO de 3 instrucciones: espera SCK bajo → emite bit → espera SCK alto. Emula SPI Mode 0 bit-perfect. |
-| `time_sync` | Disciplina de reloj PPS. Detecta flancos del pulso de 1 Hz del GPS **por interrupción GPIO** y corrige el drift del oscilador interno (error < 4 µs). |
-| `watchdog` | Watchdog por hardware del RP2040. Se activa post-arranque y requiere kick periódico desde el coordinator. Si el firmware se cuelga, reinicia la placa automáticamente. |
-
----
-
-### Tareas FreeRTOS (16 en total)
-
-#### Maestro — 10 tareas
-
-| Prio | Tarea | Stack | Descripción |
-|:----:|-------|------:|-------------|
-| 8 | `tsk_frame_writer_master` | 8 KB | Ensambla frames CEV a tasa fija (3000 fr/s en F1/F2, 100 fr/s en F3) y los escribe a la MicroSD. Maneja la señal de power-loss para cierre de emergencia. |
-| 7 | `tsk_time_sync_master` | 4 KB | Recibe datos GNSS por UART y gestiona la señal PPS. Alimenta fecha/hora UTC al ensamblador CEV. |
-| MAX | `tsk_spi_link_master` | 4 KB | Handshake DRDY por polling, transacción SPI2 DMA @ 8 MHz, validación CRC32. Corre en Core 1 a prioridad máxima para garantizar >2800 Hz de throughput. |
-| 5 | `tsk_data_proc_master` | 4 KB | Desencola datos rápidos (ANA 1–16) y actualiza registros globales. |
-| 5 | `tsk_slow_proc_master` | 4 KB | Desencola datos lentos (ANA 17–32) y actualiza registros globales. |
-| 5 | `tsk_discrete_master` | 2 KB | Lee 16 entradas digitales a 20 Hz con debouncing por software y las empaqueta en bitmap de 16 bits. |
-| 5 | `tsk_imu_master` | 4 KB | Recibe datos de la IMU Xsens por UART a 100 Hz. Extrae los 12 parámetros (incluyendo yaw) y los escala a int16. |
-| 4 | `tsk_cmd_port_master` | 4 KB | Atiende consultas del protocolo RS-232 a 115200 baud (lectura de canal, configuración de formato, formateo de SD). |
-| 3 | `tsk_supervisor_master` | 2 KB | Watchdog: verifica que todas las tareas (incluyendo SPI Link) hagan check-in dentro de su timeout. |
-| 3 | `tsk_cev_writer_master` | 4 KB | Ensambla frames CEV con datos validados de todas las fuentes y los escribe al buffer de SD. |
-
-#### Esclavo — 6 tareas
-
-| Prio | Tarea | Stack | Descripción |
-|:----:|-------|------:|-------------|
-| 8 | `tsk_coordinator_slave` | 768 B | Espera SYNC_TRIG del Maestro, desbloquea las tareas de trabajo, activa el watchdog y se autodestruye. |
-| 7 | `tsk_acq_fast_slave` | 1 KB | Lee los 2× AD7606 (16 ch) a 3 kHz y envía paquetes a `q_fast_data`. |
-| 6 | `tsk_acq_slow_slave` | 1 KB | Lee el AD7490 (16 ch) a ~20 Hz y envía paquetes a `q_slow_data`. |
-| 6 | `tsk_spi_link_slave` | 1 KB | Desencola paquetes, agrega header + CRC32 y los transmite por PIO + DMA. |
-| 6 | `tsk_time_sync_slave` | 768 B | Detecta pulsos PPS por interrupción GPIO y corrige el drift del oscilador (< 4 µs de error). |
-| 1 | `tsk_watchdog_slave` | 512 B | Refresca el watchdog de hardware periódicamente. Si alguna tarea bloquea el sistema, el RP2040 se reinicia. |
-
----
-
-## Protocolo de Comunicación Inter-placa
-
-Las dos placas se comunican mediante un protocolo binario propietario sobre SPI:
-
-```
-┌───────┬──────┬──────────┬──────────┬─────────────────────┬───────┐
-│ Magic │ Type │ Sequence │ Timestamp│      Payload        │ CRC32 │
-│ 0xFD  │  1B  │   2B     │   8B     │    (variable)       │  4B   │
-│  1B   │      │          │          │                     │       │
-└───────┴──────┴──────────┴──────────┴─────────────────────┴───────┘
-```
-
-| Campo | Tamaño | Descripción |
-|-------|-------:|-------------|
-| Magic | 1 B | Siempre `0xFD` — permite detectar desalineación |
-| Type | 1 B | `0x01` = datos rápidos, `0x02` = datos lentos |
-| Sequence | 2 B | Contador rolling para detectar pérdida de paquetes |
-| Timestamp | 8 B | Timestamp en nanosegundos, disciplinado por PPS |
-| Length | 2 B | Longitud del payload en bytes |
-| Payload | variable | `fast_data_payload_t` (40 B) o `slow_data_payload_t` (40 B) |
-| CRC32 | 4 B | IEEE 802.3, polinomio `0xEDB88320` |
-
----
-
-## Formatos de Muestreo CEV
-
-El sistema implementa tres formatos de empaquetamiento conformes al estándar del Centro de Ensayos en Vuelo:
-
-| Formato | Frames/ciclo | Words/frame | Ciclos/seg | Frames/seg | Throughput |
-|:-------:|:------------:|:-----------:|:----------:|:----------:|:----------:|
-| F1 | 40 | 17 | 75 | 3000 | ~102 KB/s |
-| F2 | 40 | 11 | 75 | 3000 | ~66 KB/s |
-| F3 | 10 | 6 | 10 | 100 | ~1.2 KB/s |
-
-Cada frame es un bloque de N words de 16 bits (`int16_t`). Los canales rápidos (ANA 1–16) aparecen en cada frame, mientras que los canales lentos, discretas, IMU (incluyendo **Yaw como DSP_13** en ranuras originalmente libres) y tiempo GNSS se distribuyen mediante **tablas de sub-conmutación** a lo largo del ciclo.
-
-El formato activo se almacena en NVS (memoria no volátil) y se puede cambiar remotamente mediante el puerto de comandos RS-232.
-
-### Designación de Parámetros IMU (DSP)
-
-| DSP | Parámetro | Escala | Resolución |
-|:---:|-----------|:------:|:----------:|
-| DSP 1–3 | Aceleración (X, Y, Z) | ×500 | 0.002 m/s² |
-| DSP 4–6 | Giróscopo (X, Y, Z) | ×100 | 0.01 °/s |
-| DSP 7–9 | Magnetómetro (X, Y, Z) | ×10000 | 0.0001 a.u. |
-| DSP 10 | Roll | ×100 | 0.01° |
-| DSP 11 | Pitch | ×100 | 0.01° |
-| DSP 12 | Sincronismo PPS | — | — |
-| **DSP 13** | **Yaw (Guiñada)** | **×100** | **0.01°** |
-
-> **Nota sobre DSP_13:** El documento CEV original define DSP 1–12, pero solo DSP 1–11 corresponden a la IMU (DSP 12 es sincronismo). Para incluir los 12 parámetros del sensor Xsens MTi-28A53G35, se utiliza una ranura «Libre» de cada formato como DSP_13: Frame 39 Word 17 (F1), Frame 13 Word 11 (F2), Frame 7 Word 6 (F3).
-
----
-
-## Modos de Operación
-
-### Modo Vuelo (sin pendrive al encender)
-Modo normal de operación. El sistema completo adquiere, procesa y almacena datos de vuelo continuamente. Si se detecta una caída de tensión en la alimentación de la aeronave (GPIO 46), se ejecuta un cierre de emergencia del archivo para proteger la integridad de los datos.
-
-### Modo Descarga (pendrive conectado al encender)
-El sistema no arranca la adquisición. Monta la MicroSD y el pendrive, copia todos los archivos `FDR_*.bin` al pendrive, y queda en idle.
-
----
-
-## Formato de Archivo de Vuelo
-
-Cada archivo `FDR_XXXX.bin` comienza con un header de 12 bytes que permite la autodetección del formato:
-
-| Offset | Campo | Tipo | Valor |
-|:------:|-------|------|-------|
-| 0–3 | `magic` | uint32 | `0xFD464452` ("FDR" + 0xFD) |
-| 4 | `version` | uint8 | `1` |
-| 5 | `format` | uint8 | `1`, `2` o `3` |
-| 6–7 | `reserved` | uint16 | `0x0000` |
-| 8–11 | `crc32` | uint32 | CRC32 de los bytes [0..7] |
-
-A continuación del header se escriben los frames CEV como bloques consecutivos de `int16_t`, sin separadores ni headers intermedios.
-
----
-
-## Herramienta de Post-proceso (FDR Converter)
-
-El repositorio incluye una herramienta de escritorio en Python (`FDR_Converter/`) para el análisis post-vuelo:
-
-- **Autodetección** del formato CEV mediante el header del archivo.
-- **Decodificación** de la sub-conmutación (des-multiplexación de los 52 parámetros).
-- **Exportación a CSV** con una columna por parámetro y una fila por ciclo.
-- **Visualización interactiva** con gráficos de señales analógicas, discretas, IMU y timestamps GNSS.
-- **Detección automática de pendrive** para uso offline en el hangar.
+## Compilación
 
 ```bash
-pip install matplotlib numpy
-python fdr_converter.py
-```
-
----
-
-## Flujo de Datos Completo
-
-```
-         RP2040 (Esclavo)                         ESP32-S3 (Maestro)
-┌─────────────────────────┐              ┌──────────────────────────────────┐
-│                         │              │                                  │
-│ AD7606 ×2 ──► acq_fast ─┤              │  GPS ──UART──► gnss ──────────┐  │
-│ (16 ch, 3kHz)           │              │  IMU ──UART──► imu_xsens ───┐ │  │
-│                         │              │  TCA9555 -> I2C -> discrete ──┐ │ │  │
-│ AD7490 ────► acq_slow ──┤   SPI+DRDY   │                          │  │ │  │
-│ (16 ch, 20Hz)          ├─────────────►│  spi_link ──► data_proc──┤  │ │  │
-│                         │              │              slow_proc ──┤  │ │  │
-│ PPS ───────► time_sync  │              │                          ▼  ▼ ▼  │
-│ (< 4µs drift)           │              │              ┌──────────────────┐│
-│                         │              │              │ sample_format    ││
-│ SYNC_TRIG ─► coordinator│              │              │ (ensamblador CEV)││
-│                         │              │              └────────┬─────────┘│
-└─────────────────────────┘              │                       ▼          │
-                                         │              frame_writer ──► SD │
-                                         │              (FDR_XXXX.bin)      │
-                                         └──────────────────────────────────┘
-```
-
----
-
-## Requisitos y Configuración de Desarrollo
-
-### Placa Maestra (ESP32-S3)
-- **Framework:** Espressif IoT Development Framework (ESP-IDF v5.5).
-- **Lenguaje:** C.
-- **IDE Recomendado:** Visual Studio Code con la extensión [ESP-IDF](https://marketplace.visualstudio.com/items?itemName=espressif.esp-idf-extension).
-
-### Placa Esclava (RP2040-Zero)
-- **Framework:** Raspberry Pi Pico SDK 2.2 + FreeRTOS SMP (submódulo de Git).
-- **Lenguaje:** C.
-- **IDE Recomendado:** Visual Studio Code con la extensión [Raspberry Pi Pico](https://marketplace.visualstudio.com/items?itemName=raspberry-pi.raspberry-pi-pico).
-
-### Post-proceso (FDR Converter)
-- **Lenguaje:** Python 3.11+.
-- **Dependencias:** `matplotlib`, `numpy`, `tkinter` (incluido en Python estándar).
-
-### Compilación
-
-```bash
-# Maestro (ESP-IDF)
+# Maestro
 cd FDR_Master
 idf.py build
 idf.py flash monitor
 
-# Esclavo (Pico SDK)
+# Esclavo
 cd FDR_Slave
 mkdir build && cd build
 cmake ..
-make
-# Copiar .uf2 al RP2040 en modo BOOTSEL
+ninja
+# Copiar build/FDR_Slave.uf2 al RP2040 en BOOTSEL
 ```
 
+```bash
+# Post-proceso
+pip install matplotlib numpy
+python FDR_Converter/fdr_converter.py
+```

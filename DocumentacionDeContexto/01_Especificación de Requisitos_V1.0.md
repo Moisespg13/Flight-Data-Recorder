@@ -1,5 +1,9 @@
 # **Especificación de Requisitos del Sistema – FDR (v1.0)**
 
+> **Nota de implementación (septiembre 2026).** Este archivo es la línea base de requisitos. El firmware vigente se apartó en varios puntos: no hay eMMC ni RTC externo; la descarga es USB Host MSC a un pendrive; las analógicas lentas son un AD7490 a ~20 Hz; las 16 discretas las lee el maestro con un TCA9555. El estado real está en `fdr_system_architecture.md`.
+
+
+
 ## **1\. Alcance**
 
 Registrador de datos de vuelo, modular, con arquitectura abierta, apto para ensayos del CEV-FAA.

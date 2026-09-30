@@ -42,11 +42,19 @@ typedef struct __attribute__((packed)) {
 
 // Estructuras para cargas útiles específicas
 
-// Payload: Señales rápidas (3000 Hz) - 40 bytes
+// Una muestra rápida (1 instante × 16 canales) — 40 bytes
 typedef struct __attribute__((packed)) {
   uint64_t timestamp_ns; // Tiempo de adquisición (nanosegundos)
   int16_t channels[16];  // 16 canales * 16 bits
 } fast_data_payload_t;
+
+// 4 muestras por paquete SPI: ~750 pkt/s en lugar de 3000.
+// Cada muestra conserva su timestamp. La cabecera usa el de la primera.
+#define FAST_SAMPLES_PER_SPI_PKT 4
+
+typedef struct __attribute__((packed)) {
+  fast_data_payload_t samples[FAST_SAMPLES_PER_SPI_PKT];
+} fast_data_spi_payload_t;
 
 // Payload: Señales lentas (10 Hz) - 40 bytes
 typedef struct __attribute__((packed)) {

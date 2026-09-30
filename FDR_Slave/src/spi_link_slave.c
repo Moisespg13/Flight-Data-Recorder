@@ -1,3 +1,19 @@
+/**
+ * @file spi_link_slave.c
+ * @brief Enlace SPI inter-placa (lado Esclavo, RP2040 vía PIO).
+ *
+ * Protocolo de handshake con el Maestro (ESP32-S3):
+ *
+ *   1. Slave arma el paquete (header + payload + CRC32), reinicia la state
+ *      machine del PIO y arranca el DMA que alimenta su FIFO
+ *   2. Slave sube DRDY ("datos listos")
+ *   3. Master baja CS y clockea el paquete completo
+ *   4. Slave detecta CS HIGH por interrupción (transacción terminada)
+ *   5. Slave baja DRDY ("listo para el siguiente")
+ *   6. Master detecta DRDY LOW y vuelve al paso 1
+ *
+ * Entre el paso 1 y el 3 la tarea duerme: no hay sondeo en ningún punto.
+ */
 
 #include "spi_link_slave.h"
 #include "crc_utils.h"
@@ -20,11 +36,21 @@
 static uint8_t tx_buffer[sizeof(fdr_header_t) + FDR_MAX_PAYLOAD + 4];
 static uint16_t s_seq_fast = 0;
 static uint16_t s_seq_slow = 0;
+static fast_data_spi_payload_t s_fast_batch;
+static int s_fast_batch_count = 0;
 
 static PIO s_pio = pio0;
 static uint s_sm = 0;
 static uint s_offset = 0;
 static int s_dma_chan = -1;
+
+// El programa PIO codifica CS y SCK como índices absolutos de GPIO. Si alguien
+// mueve el pinout en pin_config.h sin tocar el .pio, el enlace queda mudo y sin
+// ningún síntoma que apunte a la causa, así que lo trabamos acá.
+_Static_assert(PIN_LINK_CS == spi_slave_tx_CS_GPIO,
+               "PIN_LINK_CS no coincide con CS_GPIO en spi_slave_tx.pio");
+_Static_assert(PIN_LINK_SCK == spi_slave_tx_SCK_GPIO,
+               "PIN_LINK_SCK no coincide con SCK_GPIO en spi_slave_tx.pio");
 
 void spi_link_slave_init(void) {
   // Configurar DRDY como salida (LOW por defecto)
@@ -36,14 +62,16 @@ void spi_link_slave_init(void) {
   s_offset = pio_add_program(s_pio, &spi_slave_tx_program);
   s_sm = pio_claim_unused_sm(s_pio, true);
 
-  // Inicializar PIO: MISO=GP1, SCK=GP2
-  spi_slave_tx_program_init(s_pio, s_sm, s_offset, PIN_LINK_TX, PIN_LINK_SCK);
+  // Inicializar PIO (con gating por CS: ver spi_slave_tx.pio)
+  spi_slave_tx_program_init(s_pio, s_sm, s_offset, PIN_LINK_TX, PIN_LINK_SCK,
+                            PIN_LINK_CS);
 
   // Claim DMA channel para alimentar el PIO TX FIFO
   s_dma_chan = dma_claim_unused_channel(true);
 
-  printf("[SPI_LINK] PIO SPI Slave init (SM=%u DMA=%d MISO=GP%d SCK=GP%d DRDY=GP%d)\n",
-         s_sm, s_dma_chan, PIN_LINK_TX, PIN_LINK_SCK, PIN_DRDY);
+  printf("[SPI_LINK] PIO SPI Slave init (SM=%u DMA=%d CS=GP%d MISO=GP%d "
+         "SCK=GP%d DRDY=GP%d)\n",
+         s_sm, s_dma_chan, PIN_LINK_CS, PIN_LINK_TX, PIN_LINK_SCK, PIN_DRDY);
 }
 
 static void send_packet(uint8_t type, uint16_t *seq, uint64_t ts_ns,
@@ -125,8 +153,17 @@ static void send_packet(uint8_t type, uint16_t *seq, uint64_t ts_ns,
 
 void spi_link_slave_send_fast(const fast_data_payload_t *payload) {
   if (!payload) return;
-  send_packet(PKT_TYPE_FAST_DATA, &s_seq_fast, payload->timestamp_ns,
-              payload, sizeof(fast_data_payload_t));
+
+  s_fast_batch.samples[s_fast_batch_count] = *payload;
+  s_fast_batch_count++;
+  if (s_fast_batch_count < FAST_SAMPLES_PER_SPI_PKT) {
+    return;
+  }
+
+  send_packet(PKT_TYPE_FAST_DATA, &s_seq_fast,
+              s_fast_batch.samples[0].timestamp_ns, &s_fast_batch,
+              sizeof(fast_data_spi_payload_t));
+  s_fast_batch_count = 0;
 }
 
 void spi_link_slave_send_slow(const slow_data_payload_t *payload) {

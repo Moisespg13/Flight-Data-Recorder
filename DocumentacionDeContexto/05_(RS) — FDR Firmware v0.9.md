@@ -1,5 +1,8 @@
 # **Documento de Requisitos de Software (RS) — FDR Firmware v0.9**
 
+> **Nota de implementación (septiembre 2026).** Este RS es la línea base v0.9. El firmware no incorpora RTC DS3232, ADS1115, MAX22190, eMMC ni USB-CDC como camino de descarga. La hora sale del GNSS y de un offset de PPS en el RP2040. Las lentas son un AD7490 (~20 Hz). Las discretas son 16 entradas en un TCA9555 leído por el maestro a 20 Hz, con debounce por software. El enlace inter-placa es SPI a 10 MHz con CRC32, esclavo por PIO. Detalle en `fdr_system_architecture.md`.
+
+
 ## **1\. Introducción**
 
 ### **1.1 Propósito**

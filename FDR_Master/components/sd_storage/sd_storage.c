@@ -24,8 +24,7 @@ static const char *TAG = "SD_STORAGE";
 static bool sd1_ok = false;
 static bool sd2_ok = false;
 
-#define WRITE_BUFFER_SIZE 4096
-#define FSYNC_EVERY_N_FLUSHES 32
+#define WRITE_BUFFER_SIZE (16 * 1024)
 #define FREE_SPACE_THRESHOLD_BYTES (1024ULL * 1024ULL * 1024ULL)
 
 #define FILE_INDEX_MIN 1
@@ -121,7 +120,7 @@ esp_err_t sd_storage_init(void) {
       .sclk_io_num = PIN_SD_CLK,
       .quadwp_io_num = -1,
       .quadhd_io_num = -1,
-      .max_transfer_sz = 8192,
+      .max_transfer_sz = 16 * 1024,
   };
   
     // Pull-ups para datos
@@ -310,11 +309,6 @@ static esp_err_t flush_buffer(void) {
       fclose(s_flight_file_1); s_flight_file_1 = NULL; sd1_ok = false;
     } else {
       ret = ESP_OK;
-      if ((s_flush_count % FSYNC_EVERY_N_FLUSHES) == 0) {
-        fflush(s_flight_file_1);
-        int fd = fileno(s_flight_file_1);
-        if (fd >= 0) fsync(fd);
-      }
     }
   }
 
@@ -326,11 +320,6 @@ static esp_err_t flush_buffer(void) {
       fclose(s_flight_file_2); s_flight_file_2 = NULL; sd2_ok = false;
     } else {
       ret = ESP_OK;
-      if ((s_flush_count % FSYNC_EVERY_N_FLUSHES) == 0) {
-        fflush(s_flight_file_2);
-        int fd = fileno(s_flight_file_2);
-        if (fd >= 0) fsync(fd);
-      }
     }
   }
 
@@ -383,18 +372,74 @@ esp_err_t sd_storage_flush(void) {
   esp_err_t ret = flush_buffer();
 
   if (s_flight_file_1 != NULL) {
-
+    fflush(s_flight_file_1);
     int fd = fileno(s_flight_file_1);
     if (fd >= 0) fsync(fd);
   }
   if (s_flight_file_2 != NULL) {
-
+    fflush(s_flight_file_2);
     int fd = fileno(s_flight_file_2);
     if (fd >= 0) fsync(fd);
   }
 
   if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
   return ret;
+}
+
+static esp_err_t flush_one(FILE *file) {
+  if (file == NULL) return ESP_ERR_INVALID_STATE;
+  flush_buffer();
+  fflush(file);
+  int fd = fileno(file);
+  if (fd >= 0) fsync(fd);
+  return ESP_OK;
+}
+
+esp_err_t sd_storage_flush_1(void) {
+  if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
+  esp_err_t ret = flush_one(s_flight_file_1);
+  if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
+  return ret;
+}
+
+esp_err_t sd_storage_flush_2(void) {
+  if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
+  esp_err_t ret = flush_one(s_flight_file_2);
+  if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
+  return ret;
+}
+
+esp_err_t sd_storage_write_error_log(const char *msg) {
+  if (msg == NULL) return ESP_ERR_INVALID_ARG;
+
+  if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
+
+  const char *mounts[2] = {MOUNT_POINT_1, MOUNT_POINT_2};
+  const bool ok_flags[2] = {sd1_ok, sd2_ok};
+  int written = 0;
+
+  for (int i = 0; i < 2; i++) {
+    if (!ok_flags[i]) continue;
+
+    char path[64];
+    snprintf(path, sizeof(path), "%s/FDR_FULL.ERR", mounts[i]);
+
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+      ESP_LOGW(TAG, "No se pudo crear %s", path);
+      continue;
+    }
+    fprintf(f, "%s\n", msg);
+    fflush(f);
+    int fd = fileno(f);
+    if (fd >= 0) fsync(fd);
+    fclose(f);
+    written++;
+    ESP_LOGI(TAG, "Log de error escrito en %s", path);
+  }
+
+  if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
+  return (written > 0) ? ESP_OK : ESP_FAIL;
 }
 
 void sd_storage_close(void) {

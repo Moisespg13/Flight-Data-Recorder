@@ -12,9 +12,10 @@
  * ensamblados según el formato de muestreo seleccionado (1, 2 o 3).
  *
  * Arquitectura de tareas del Maestro:
- *   Prio 8 - tsk_frame_writer_master: Ensambla frames CEV y los graba en SD
+ *   Prio 12 - tsk_spi_link_master:    Recibe datos del Esclavo por SPI (core 1)
+ *   Prio 9  - tsk_frame_assembler:    Ensambla frames CEV → anillo PSRAM (core 1)
+ *   Prio 6  - tsk_sd_writer:          Vacía el anillo a las dos MicroSD (core 0)
  *   Prio 7 - tsk_time_sync_master:    Sincronización GPS/PPS
- *   Prio 6 - tsk_spi_link_master:     Recibe datos del Esclavo por SPI
  *   Prio 5 - tsk_data_proc_master:    Procesa datos rápidos → buffer compartido
  *   Prio 5 - tsk_slow_proc_master:    Procesa datos lentos → buffer compartido
  *   Prio 5 - tsk_discrete_master:     Lee 16 entradas digitales → buffer compartido
@@ -28,10 +29,14 @@
 #include "crc_utils.h"
 #include "discrete_signals.h"
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_psram.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "gnss.h"
 #include "imu_xsens.h"
@@ -44,6 +49,7 @@
 #include "supervisor.h"
 #include "spi_link.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "MASTER_LOGIC";
@@ -58,6 +64,29 @@ static QueueHandle_t q_rx_slow = NULL;
 // Buffer temporal para frames CEV (máximo 17 words × 2 bytes = 34 bytes)
 // ============================================================================
 static int16_t s_frame_buf[FMT1_WORDS_PER_FRAME]; // 17 = máximo posible
+
+// Ticks en los que el ensamblador no llegó a tiempo
+static uint32_t s_writer_overruns = 0;
+
+// Anillo en PSRAM. 2 MB ≈ 20 s de formato 1 (~100 KB/s). Absorbe el fsync
+// de las dos SD sin frenar el ensamblado. El chunk de copia queda en SRAM.
+#define SD_RING_BYTES (2 * 1024 * 1024)
+#define SD_IO_CHUNK   (16 * 1024)
+
+// fsync desfasado: nunca las dos SD a la vez.
+// SD1: 2, 4, 6… min  |  SD2: 3, 5, 7… min
+#define SD_SYNC_PERIOD_US (2LL * 60LL * 1000000LL)
+#define SD1_FIRST_SYNC_US (2LL * 60LL * 1000000LL)
+#define SD2_FIRST_SYNC_US (3LL * 60LL * 1000000LL)
+#define SD_SYNC_POSTPONE_US (60LL * 1000000LL)
+static uint8_t *s_sd_ring = NULL;
+static uint8_t *s_sd_chunk = NULL;
+static size_t s_ring_r = 0;
+static size_t s_ring_w = 0;
+static size_t s_ring_used = 0;
+static SemaphoreHandle_t s_ring_mtx = NULL;
+static TaskHandle_t s_sd_task = NULL;
+static volatile bool s_sd_stop = false;
 
 // Contador de frames dentro del ciclo (0..39 para F1/F2, 0..9 para F3)
 static uint8_t s_frame_counter = 0;
@@ -114,33 +143,153 @@ static uint8_t read_format_from_nvs(void) {
   return (uint8_t)format;
 }
 
+static bool ring_push(const uint8_t *data, size_t len) {
+  if (s_sd_ring == NULL || s_ring_mtx == NULL || len == 0) {
+    return false;
+  }
+  if (xSemaphoreTake(s_ring_mtx, pdMS_TO_TICKS(20)) != pdTRUE) {
+    return false;
+  }
+  if (s_ring_used + len > SD_RING_BYTES) {
+    xSemaphoreGive(s_ring_mtx);
+    return false;
+  }
+  size_t first = SD_RING_BYTES - s_ring_w;
+  if (first > len) {
+    first = len;
+  }
+  memcpy(s_sd_ring + s_ring_w, data, first);
+  if (first < len) {
+    memcpy(s_sd_ring, data + first, len - first);
+  }
+  s_ring_w = (s_ring_w + len) % SD_RING_BYTES;
+  s_ring_used += len;
+  xSemaphoreGive(s_ring_mtx);
+  if (s_sd_task != NULL) {
+    xTaskNotifyGive(s_sd_task);
+  }
+  return true;
+}
+
+static size_t ring_pop(uint8_t *dst, size_t max_len) {
+  if (s_sd_ring == NULL || s_ring_mtx == NULL || max_len == 0) {
+    return 0;
+  }
+  if (xSemaphoreTake(s_ring_mtx, pdMS_TO_TICKS(50)) != pdTRUE) {
+    return 0;
+  }
+  size_t n = s_ring_used;
+  if (n > max_len) {
+    n = max_len;
+  }
+  if (n == 0) {
+    xSemaphoreGive(s_ring_mtx);
+    return 0;
+  }
+  size_t first = SD_RING_BYTES - s_ring_r;
+  if (first > n) {
+    first = n;
+  }
+  memcpy(dst, s_sd_ring + s_ring_r, first);
+  if (first < n) {
+    memcpy(dst + first, s_sd_ring, n - first);
+  }
+  s_ring_r = (s_ring_r + n) % SD_RING_BYTES;
+  s_ring_used -= n;
+  xSemaphoreGive(s_ring_mtx);
+  return n;
+}
+
+static size_t ring_used(void) {
+  size_t n = 0;
+  if (s_ring_mtx != NULL &&
+      xSemaphoreTake(s_ring_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
+    n = s_ring_used;
+    xSemaphoreGive(s_ring_mtx);
+  }
+  return n;
+}
+
+// Core 0: único lugar que toca la SD. El ensamblador sigue en el core 1.
+static void tsk_sd_writer(void *pvParameters) {
+  (void)pvParameters;
+  ESP_LOGI(TAG, "SD writer iniciado (prio 6, core 0, anillo PSRAM %u KB, fsync SD1@2m SD2@3m)",
+           (unsigned)(SD_RING_BYTES / 1024));
+  uint8_t *chunk = s_sd_chunk;
+  if (chunk == NULL) {
+    ESP_LOGE(TAG, "Sin buffer de chunk de SD");
+    vTaskDelete(NULL);
+    return;
+  }
+  const int64_t t0 = esp_timer_get_time();
+  int64_t next_sync1_us = t0 + SD1_FIRST_SYNC_US;
+  int64_t next_sync2_us = t0 + SD2_FIRST_SYNC_US;
+
+  while (1) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+
+    size_t n;
+    while ((n = ring_pop(chunk, SD_IO_CHUNK)) > 0) {
+      if (s_recording_aborted) {
+        continue;
+      }
+      if (sd_storage_write(chunk, n) != ESP_OK) {
+        ESP_LOGE(TAG, "Error crítico: Fallo de escritura en ambas SD "
+                      "(posible SD llena). Abortando grabación.");
+        s_recording_aborted = true;
+        led_set_mode(LED_MODE_FLIGHT_ERROR);
+        sd_storage_write_error_log(
+            "Falla en Modo Vuelo: SD llena o error de I/O.");
+        sd_storage_close();
+      }
+    }
+
+    if (s_sd_stop && ring_used() == 0) {
+      ESP_LOGW(TAG, "Power-loss: anillo vacío, fsync y cierre");
+      sd_storage_flush();
+      sd_storage_close();
+      ESP_LOGW(TAG, "*** Archivo cerrado exitosamente. Sistema seguro. ***");
+      vTaskSuspend(NULL);
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    bool ring_busy = ring_used() > (SD_RING_BYTES / 2);
+    if (now_us >= next_sync1_us) {
+      if (ring_busy) {
+        next_sync1_us = now_us + SD_SYNC_POSTPONE_US;
+        ESP_LOGW(TAG, "fsync SD1 pospuesto (anillo ocupado)");
+      } else {
+        sd_storage_flush_1();
+        next_sync1_us += SD_SYNC_PERIOD_US;
+        ESP_LOGI(TAG, "fsync SD1");
+      }
+    } else if (now_us >= next_sync2_us) {
+      if (ring_busy) {
+        next_sync2_us = now_us + SD_SYNC_POSTPONE_US;
+        ESP_LOGW(TAG, "fsync SD2 pospuesto (anillo ocupado)");
+      } else {
+        sd_storage_flush_2();
+        next_sync2_us += SD_SYNC_PERIOD_US;
+        ESP_LOGI(TAG, "fsync SD2");
+      }
+    }
+  }
+}
+
 // ============================================================================
-// Tarea: Escritor de Frames CEV a MicroSD (Prioridad 8 - MÁXIMA)
+// Tarea: Ensamblado de Frames CEV (Prioridad 9, core 1)
 // ============================================================================
 /**
- * @brief Ensambla frames CEV a tasa fija y los graba en la MicroSD.
- *
  * La tasa depende del formato activo:
  *   F1/F2: cada 1 ms ensambla 3 frames (= 3000 frames/seg)
  *   F3:    cada 10 ms ensambla 1 frame (= 100 frames/seg)
  *
- * Cada frame es un bloque de N words de 16 bits (N = 17, 11 o 6),
- * escritos consecutivamente sin separadores ni headers.
+ * Cada frame es un bloque de N words de 16 bits, copiado al anillo de PSRAM.
+ * No se descarta un frame: un hueco desalinea el archivo para siempre.
  */
-static void tsk_frame_writer_master(void *pvParameters) {
-  ESP_LOGI(TAG, "Tarea de Escritura CEV Iniciada");
+static void tsk_frame_assembler(void *pvParameters) {
+  ESP_LOGI(TAG, "Tarea de Ensamblado CEV Iniciada (Prio 9, core 1)");
 
-  // La MicroSD ya fue inicializada en master_logic_start().
-  // Abrir el archivo de vuelo con el formato CEV activo.
-  esp_err_t ret = sd_storage_open_flight_file(sample_format_get_active());
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "*** ERROR: No se pudo crear archivo de vuelo.");
-    led_set_mode(LED_MODE_FLIGHT_ERROR);
-    vTaskDelete(NULL);
-    return;
-  }
-
-  // 3. Configuración del formato
   int frames_per_tick = sample_format_get_frames_per_tick();
   int tick_period_ms = sample_format_get_tick_period_ms();
   int words_per_frame = sample_format_get_words_per_frame();
@@ -158,55 +307,51 @@ static void tsk_frame_writer_master(void *pvParameters) {
   while (1) {
     supervisor_checkin(TASK_ID_WRITER);
 
-    // ── Verificar señal de Power-Loss ──────────────────────────────
-    // Si la ISR envió una notificación, el valor será != 0.
-    // Usamos ulTaskNotifyTake para revisar sin bloquear (timeout = 0).
     uint32_t power_loss = ulTaskNotifyTake(pdTRUE, 0);
     if (power_loss != 0) {
-      ESP_LOGW(TAG, "*** POWER-LOSS DETECTADO! Cerrando archivo de vuelo... ***");
-
-      // Flush de emergencia: volcar buffer + fsync + fclose
-      sd_storage_flush();
-      sd_storage_close();
-
-      ESP_LOGW(TAG, "*** Archivo cerrado exitosamente. Sistema seguro. ***");
-
-      // Suspender esta tarea para siempre (ya no hay nada que escribir)
+      ESP_LOGW(TAG, "*** POWER-LOSS DETECTADO! Vaciando anillo y cerrando... ***");
+      s_sd_stop = true;
+      if (s_sd_task != NULL) {
+        xTaskNotifyGive(s_sd_task);
+      }
       vTaskSuspend(NULL);
     }
 
-    // ── Ensamblar N frames por tick ────────────────────────────────
     for (int f = 0; f < frames_per_tick; f++) {
       int words = sample_format_assemble_frame(s_frame_counter, s_frame_buf);
 
       if (words > 0 && !s_recording_aborted) {
-        ret = sd_storage_write(s_frame_buf, (size_t)words * sizeof(int16_t));
-        if (ret != ESP_OK) {
-          ESP_LOGE(TAG, "Error crítico: Fallo de escritura en SD (posible SD llena). Abortando grabación.");
-          s_recording_aborted = true;
-          
-          // 1. Indicar visualmente el error
-          led_set_mode(LED_MODE_FLIGHT_ERROR);
-          
-          // 2. Cerrar archivo limpiamente para no corromper la FAT32
-          sd_storage_close();
-          
-          // 3. Intentar grabar log de error (puede fallar si está 100% llena)
-          FILE *err_f = fopen("/sdcard/FDR_FULL.ERR", "w");
-          if (err_f != NULL) {
-            fprintf(err_f, "Falla en Modo Vuelo: SD llena o error de I/O en frame %d.\n", s_frame_counter);
-            fclose(err_f);
-            ESP_LOGI(TAG, "Log de error creado en la SD.");
-          } else {
-            ESP_LOGW(TAG, "No se pudo crear log de error, la SD está completamente llena.");
-          }
+        while (!ring_push((const uint8_t *)s_frame_buf, frame_bytes)) {
+          vTaskDelay(pdMS_TO_TICKS(2));
         }
       }
 
-      // Avanzar contador circular
       s_frame_counter++;
       if (s_frame_counter >= frames_per_cycle) {
         s_frame_counter = 0;
+      }
+    }
+
+    // Grabación abortada: no tiene sentido seguir ensamblando frames a 1 kHz.
+    // Seguimos haciendo check-in para que el supervisor no reporte una falsa
+    // alarma de tarea colgada.
+    if (s_recording_aborted) {
+      ESP_LOGE(TAG, "Grabación detenida. La tarea de escritura queda inactiva.");
+      while (1) {
+        supervisor_checkin(TASK_ID_WRITER);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+    }
+
+    // Detección de sobrecarga. Los frames se escriben crudos y consecutivos,
+    // sin separadores ni marca de tiempo propia, así que un tick perdido deja
+    // un hueco temporal que no es detectable al analizar el archivo. Contarlo
+    // acá es la única forma de saber que ocurrió.
+    if ((xTaskGetTickCount() - xLastWakeTime) > pdMS_TO_TICKS(tick_period_ms)) {
+      s_writer_overruns++;
+      if (s_writer_overruns <= 10 || s_writer_overruns % 1000 == 0) {
+        ESP_LOGW(TAG, "Sobrecarga del writer #%lu (tick de %d ms vencido)",
+                 (unsigned long)s_writer_overruns, tick_period_ms);
       }
     }
 
@@ -417,8 +562,16 @@ static void tsk_cmd_port_master(void *pvParameters) {
 esp_err_t master_logic_start(void) {
   ESP_LOGI(TAG, "Arrancando Lógica de Maestro...");
 
-  // 0. Configurar señal de sincronización
-  // Ya no se requiere inicializar SYNC_TRIG físicamente
+  // 0. Servicio de ISR de GPIO: único punto de instalación de todo el proyecto.
+  //    Lo usan la ISR de DRDY (spi_link), la de PPS (gnss) y la de power-loss.
+  //    Llamarlo más de una vez funciona, pero el driver logea a nivel E en cada
+  //    llamada redundante y ensucia el arranque.
+  esp_err_t isr_ret = gpio_install_isr_service(0);
+  if (isr_ret != ESP_OK) {
+    ESP_LOGE(TAG, "No se pudo instalar el servicio de ISR de GPIO: %s",
+             esp_err_to_name(isr_ret));
+    return isr_ret;
+  }
 
   // 1. Leer formato de muestreo desde NVS e inicializar ensamblador
   uint8_t format = read_format_from_nvs();
@@ -482,12 +635,45 @@ esp_err_t master_logic_start(void) {
     return ret;
   }
 
-  // 8. Crear Tarea de Escritura CEV a SD (Prio 8 - MÁXIMA)
-  BaseType_t ok =
-      xTaskCreate(tsk_frame_writer_master, "writer", 8192, NULL, 8,
-                  &s_writer_task_handle);
+  // 8. Archivo de vuelo y anillo en PSRAM, antes de las tareas de grabación.
+  ret = sd_storage_open_flight_file(sample_format_get_active());
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "*** ERROR: No se pudo crear archivo de vuelo.");
+    led_set_mode(LED_MODE_FLIGHT_ERROR);
+    return ESP_FAIL;
+  }
+  if (!esp_psram_is_initialized()) {
+    ESP_LOGE(TAG, "PSRAM no inicializada: el anillo de %u KB no cabe en SRAM",
+             (unsigned)(SD_RING_BYTES / 1024));
+    return ESP_ERR_NO_MEM;
+  }
+  s_ring_mtx = xSemaphoreCreateMutex();
+  s_sd_ring = (uint8_t *)heap_caps_aligned_alloc(
+      32, SD_RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  s_sd_chunk = (uint8_t *)heap_caps_malloc(
+      SD_IO_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  if (s_ring_mtx == NULL || s_sd_ring == NULL || s_sd_chunk == NULL) {
+    ESP_LOGE(TAG, "Sin RAM para anillo PSRAM (%u) o chunk de SD",
+             (unsigned)SD_RING_BYTES);
+    return ESP_ERR_NO_MEM;
+  }
+  ESP_LOGI(TAG,
+           "Anillo de SD: %u KB en PSRAM (PSRAM %u KB, libre %u KB; SRAM %u)",
+           (unsigned)(SD_RING_BYTES / 1024),
+           (unsigned)(esp_psram_get_size() / 1024),
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+           (unsigned)esp_get_free_internal_heap_size());
+
+  BaseType_t ok = xTaskCreatePinnedToCore(tsk_sd_writer, "sd_io", 8192, NULL, 6,
+                                           &s_sd_task, 0);
   if (ok != pdPASS) {
-    ESP_LOGE(TAG, "Error al crear tarea de escritura");
+    ESP_LOGE(TAG, "Error al crear tarea de SD");
+    return ESP_ERR_NO_MEM;
+  }
+  ok = xTaskCreatePinnedToCore(tsk_frame_assembler, "assembler", 4096, NULL, 9,
+                               &s_writer_task_handle, 1);
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG, "Error al crear tarea de ensamblado");
     return ESP_ERR_NO_MEM;
   }
 
@@ -499,14 +685,16 @@ esp_err_t master_logic_start(void) {
   }
 
   // 10. Crear Tarea de Procesamiento Rápido (Prio 5)
-  ok = xTaskCreate(tsk_data_proc_master, "data_proc", 4096, NULL, 5, NULL);
+  ok = xTaskCreatePinnedToCore(tsk_data_proc_master, "data_proc", 4096, NULL, 5,
+                               NULL, 1);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "Error al crear tarea de procesamiento rápido");
     return ESP_ERR_NO_MEM;
   }
 
   // 11. Crear Tarea de Procesamiento Lento (Prio 5)
-  ok = xTaskCreate(tsk_slow_proc_master, "slow_proc", 4096, NULL, 5, NULL);
+  ok = xTaskCreatePinnedToCore(tsk_slow_proc_master, "slow_proc", 4096, NULL, 5,
+                               NULL, 1);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "Error al crear tarea de procesamiento lento");
     return ESP_ERR_NO_MEM;
@@ -550,7 +738,6 @@ esp_err_t master_logic_start(void) {
   };
   ret = gpio_config(&pwr_conf);
   if (ret == ESP_OK) {
-    gpio_install_isr_service(0);
     gpio_isr_handler_add(PIN_POWER_LOSS, power_loss_isr, NULL);
     ESP_LOGI(TAG, "Power-Loss detector activo en GPIO %d", PIN_POWER_LOSS);
   } else {

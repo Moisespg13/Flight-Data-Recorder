@@ -54,6 +54,15 @@ static gnss_position_t s_position = {0};
 static volatile int64_t s_pps_timestamp_us = 0;
 static volatile bool s_pps_received = false;
 
+// Instante del último fix válido, para poder invalidar la posición si el
+// receptor deja de reportar. Sin esto, un GPS que muere a mitad de vuelo
+// sigue publicando la última posición como si fuera buena.
+static volatile int64_t s_last_fix_us = 0;
+
+// Ventanas de validez
+#define PPS_TIMEOUT_US 2000000 // Dos pulsos perdidos = sincronismo caído
+#define FIX_TIMEOUT_US 3000000 // Tres tramas RMC perdidas = fix caído
+
 // Hora base en nanosegundos (se actualiza con cada $GPRMC válido)
 static volatile uint64_t s_utc_base_ns = 0;
 
@@ -112,32 +121,49 @@ static double nmea_to_degrees(const char *raw, const char *hemisphere) {
   return result;
 }
 
-/**
- * @brief Extrae el campo N de una trama NMEA separada por comas.
- *
- * Modifica el string original (pone '\0' en las comas).
- * Devuelve un puntero al campo pedido, o NULL si no existe.
- */
-static char *nmea_get_field(char *sentence, int index) {
-  int count = 0;
-  char *start = sentence;
+#define NMEA_MAX_FIELDS 20
 
-  while (*start) {
-    if (count == index) {
-      // Buscar el final del campo (siguiente coma o fin de string)
-      char *end = strchr(start, ',');
-      if (end != NULL) {
-        *end = '\0';
-      }
-      return start;
+static char s_empty[] = "";
+
+/**
+ * @brief Parte una sentencia NMEA en campos terminados en '\0'.
+ *
+ * Copia la sentencia una sola vez a @p buf, reemplaza cada coma por '\0' y
+ * deja en @p fields un puntero al inicio de cada campo. Los campos que la
+ * sentencia no trae quedan apuntando a string vacío, de modo que el resto
+ * del parser nunca tiene que comprobar NULL ni distinguir "campo ausente"
+ * de "campo vacío".
+ *
+ * @return Cantidad de campos presentes en la sentencia.
+ */
+static int nmea_split(const char *sentence, char *buf, size_t buf_len,
+                      char *fields[], int max_fields) {
+  strncpy(buf, sentence, buf_len - 1);
+  buf[buf_len - 1] = '\0';
+
+  int n = 0;
+  char *p = buf;
+  fields[n++] = p;
+
+  while (*p != '\0' && n < max_fields) {
+    if (*p == ',') {
+      *p = '\0';
+      fields[n++] = p + 1;
     }
-    if (*start == ',') {
-      count++;
-    }
-    start++;
+    p++;
   }
 
-  return NULL;
+  // El último campo arrastra el checksum ("...*hh"): lo recortamos.
+  char *star = strchr(fields[n - 1], '*');
+  if (star != NULL) {
+    *star = '\0';
+  }
+
+  for (int i = n; i < max_fields; i++) {
+    fields[i] = s_empty;
+  }
+
+  return n;
 }
 
 /**
@@ -167,20 +193,17 @@ static uint64_t time_to_day_ns(uint8_t h, uint8_t m, uint8_t s) {
  *   8: course
  *   9: ddmmyy    (fecha)
  */
-static void parse_rmc(char *sentence) {
-  // Hacer una copia de trabajo (nmea_get_field modifica el string)
-  char work[256];
-  strncpy(work, sentence, sizeof(work) - 1);
-  work[sizeof(work) - 1] = '\0';
+static void parse_rmc(const char *sentence) {
+  char buf[256];
+  char *f[NMEA_MAX_FIELDS];
 
-  // Extraer campos usando una copia limpia para cada uno
-  // (reconstruimos el string cada vez porque get_field es destructivo)
-  char copy[256];
+  // Necesitamos hasta el campo 9 (fecha) para considerar la trama utilizable.
+  if (nmea_split(sentence, buf, sizeof(buf), f, NMEA_MAX_FIELDS) < 10) {
+    return;
+  }
 
-  // Campo 1: Hora
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *time_str = nmea_get_field(copy, 1);
-  if (time_str == NULL || strlen(time_str) < 6) {
+  const char *time_str = f[1];
+  if (strlen(time_str) < 6) {
     return;
   }
 
@@ -188,31 +211,14 @@ static void parse_rmc(char *sentence) {
   char mm[3] = {time_str[2], time_str[3], '\0'};
   char ss[3] = {time_str[4], time_str[5], '\0'};
 
-  // Campo 2: Validez
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *status = nmea_get_field(copy, 2);
-  bool valid = (status != NULL && *status == 'A');
+  bool valid = (f[2][0] == 'A');
 
-  // Campo 9: Fecha
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *date_str = nmea_get_field(copy, 9);
-
-  // Campo 3-6: Posición
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *lat_str = nmea_get_field(copy, 3);
-
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *lat_hem = nmea_get_field(copy, 4);
-
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *lon_str = nmea_get_field(copy, 5);
-
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *lon_hem = nmea_get_field(copy, 6);
-
-  // Campo 7: Velocidad
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  char *spd_str = nmea_get_field(copy, 7);
+  const char *lat_str = f[3];
+  const char *lat_hem = f[4];
+  const char *lon_str = f[5];
+  const char *lon_hem = f[6];
+  const char *spd_str = f[7];
+  const char *date_str = f[9];
 
   // Guardar hora
   s_time.hour = (uint8_t)atoi(hh);
@@ -221,7 +227,7 @@ static void parse_rmc(char *sentence) {
   s_time.valid = valid;
 
   // Guardar fecha (si disponible)
-  if (date_str != NULL && strlen(date_str) >= 6) {
+  if (strlen(date_str) >= 6) {
     char dd[3] = {date_str[0], date_str[1], '\0'};
     char mo[3] = {date_str[2], date_str[3], '\0'};
     char yy[3] = {date_str[4], date_str[5], '\0'};
@@ -231,11 +237,14 @@ static void parse_rmc(char *sentence) {
   }
 
   // Guardar posición
-  if (valid) {
+  if (!valid) {
+    s_position.valid = false;
+  } else {
     s_position.latitude = nmea_to_degrees(lat_str, lat_hem);
     s_position.longitude = nmea_to_degrees(lon_str, lon_hem);
-    s_position.speed_knots = (spd_str != NULL) ? (float)atof(spd_str) : 0.0f;
+    s_position.speed_knots = (float)atof(spd_str);
     s_position.valid = true;
+    s_last_fix_us = esp_timer_get_time();
 
     // Corregir la hora base con la referencia NMEA.
     // Esto recalibra el contador que el PPS auto-incrementa,
@@ -266,39 +275,28 @@ static void parse_rmc(char *sentence) {
  *   9: alt       (altitud sobre el nivel del mar, en metros)
  *  10: M         (unidad de altitud, siempre 'M')
  */
-static void parse_gga(char *sentence) {
-  char copy[256];
+static void parse_gga(const char *sentence) {
+  char buf[256];
+  char *f[NMEA_MAX_FIELDS];
+
+  // Necesitamos hasta el campo 9 (altitud).
+  if (nmea_split(sentence, buf, sizeof(buf), f, NMEA_MAX_FIELDS) < 10) {
+    return;
+  }
 
   // Campo 6: Calidad del fix (0 = sin fix)
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  copy[sizeof(copy) - 1] = '\0';
-  char *quality_str = nmea_get_field(copy, 6);
-  if (quality_str == NULL || *quality_str == '0') {
+  if (f[6][0] == '0' || f[6][0] == '\0') {
     return; // Sin fix, descartar
   }
 
-  // Campo 7: Número de satélites
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  copy[sizeof(copy) - 1] = '\0';
-  char *sat_str = nmea_get_field(copy, 7);
-  if (sat_str != NULL && sat_str[0] != '\0') {
-    s_position.satellites = (uint8_t)atoi(sat_str);
+  if (f[7][0] != '\0') {
+    s_position.satellites = (uint8_t)atoi(f[7]);
   }
-
-  // Campo 8: HDOP
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  copy[sizeof(copy) - 1] = '\0';
-  char *hdop_str = nmea_get_field(copy, 8);
-  if (hdop_str != NULL && hdop_str[0] != '\0') {
-    s_position.hdop = (float)atof(hdop_str);
+  if (f[8][0] != '\0') {
+    s_position.hdop = (float)atof(f[8]);
   }
-
-  // Campo 9: Altitud MSL (metros)
-  strncpy(copy, sentence, sizeof(copy) - 1);
-  copy[sizeof(copy) - 1] = '\0';
-  char *alt_str = nmea_get_field(copy, 9);
-  if (alt_str != NULL && alt_str[0] != '\0') {
-    s_position.altitude_m = (float)atof(alt_str);
+  if (f[9][0] != '\0') {
+    s_position.altitude_m = (float)atof(f[9]);
   }
 
   ESP_LOGD(TAG, "GGA: sats=%u hdop=%.1f alt=%.1fm",
@@ -308,7 +306,7 @@ static void parse_gga(char *sentence) {
 /**
  * @brief Procesa una línea NMEA completa.
  */
-static void process_nmea_line(char *line) {
+static void process_nmea_line(const char *line) {
   // $GPRMC / $GNRMC: hora, fecha, posición, velocidad
   if (strncmp(line, "$GPRMC", 6) == 0 || strncmp(line, "$GNRMC", 6) == 0) {
     parse_rmc(line);
@@ -375,14 +373,7 @@ esp_err_t gnss_init(void) {
     return ret;
   }
 
-  // Registrar la ISR del PPS
-  ret = gpio_install_isr_service(0);
-  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    // ESP_ERR_INVALID_STATE = ya estaba instalado (OK)
-    ESP_LOGE(TAG, "Error al instalar servicio ISR: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
+  // El servicio de ISR de GPIO lo instala master_logic_start() una única vez.
   ret = gpio_isr_handler_add(PIN_PPS, pps_isr_handler, NULL);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Error al registrar ISR del PPS: %s", esp_err_to_name(ret));
@@ -429,7 +420,7 @@ uint64_t gnss_get_utc_ns(void) {
   int64_t elapsed_us = now_us - s_pps_timestamp_us;
 
   // Si pasó más de 2 segundos desde el último PPS, el GPS se perdió
-  if (elapsed_us < 0 || elapsed_us > 2000000) {
+  if (elapsed_us < 0 || elapsed_us > PPS_TIMEOUT_US) {
     return 0;
   }
 
@@ -444,9 +435,29 @@ void gnss_get_time(gnss_time_t *time) {
 }
 
 void gnss_get_position(gnss_position_t *pos) {
-  if (pos != NULL) {
-    *pos = s_position;
+  if (pos == NULL) {
+    return;
+  }
+
+  *pos = s_position;
+
+  // El fix se declara caído si hace rato que no llega una RMC válida, aunque
+  // la última que llegó haya sido buena.
+  if (pos->valid) {
+    int64_t age_us = esp_timer_get_time() - s_last_fix_us;
+    if (age_us < 0 || age_us > FIX_TIMEOUT_US) {
+      pos->valid = false;
+    }
   }
 }
 
-bool gnss_pps_is_active(void) { return s_pps_received; }
+bool gnss_pps_is_active(void) {
+  if (!s_pps_received) {
+    return false;
+  }
+
+  // s_pps_received solo indica que alguna vez llegó un pulso. Lo que importa
+  // es si el sincronismo sigue vivo ahora.
+  int64_t age_us = esp_timer_get_time() - s_pps_timestamp_us;
+  return (age_us >= 0 && age_us <= PPS_TIMEOUT_US);
+}

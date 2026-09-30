@@ -20,12 +20,13 @@
 #include <stdint.h>
 
 /**
- * @brief Inicializa el bus SDMMC y monta el sistema de archivos FATFS.
+ * @brief Inicializa el bus SPI y monta ambas MicroSD redundantes.
  *
- * Configura los pines de la MicroSD, inicializa el driver SDMMC del
- * ESP32-S3 y monta la partición FAT en "/sdcard".
+ * Configura los pines compartidos del bus y monta cada tarjeta en su punto
+ * propio: "/sd1" y "/sd2". La grabación continúa mientras al menos una de
+ * las dos responda.
  *
- * @return ESP_OK si la tarjeta fue detectada y montada correctamente.
+ * @return ESP_OK si se montó al menos una tarjeta.
  */
 esp_err_t sd_storage_init(void);
 
@@ -61,6 +62,25 @@ esp_err_t sd_storage_write(const void *data, size_t length);
  * @return ESP_OK si el flush fue exitoso.
  */
 esp_err_t sd_storage_flush(void);
+
+/** fflush + fsync solo de SD1. No toca el directorio de SD2. */
+esp_err_t sd_storage_flush_1(void);
+
+/** fflush + fsync solo de SD2. No toca el directorio de SD1. */
+esp_err_t sd_storage_flush_2(void);
+
+/**
+ * @brief Escribe FDR_FULL.ERR en cada tarjeta que siga operativa.
+ *
+ * Deja constancia en la propia tarjeta de por qué se interrumpió la
+ * grabación, para poder diagnosticarlo después del vuelo sin la consola.
+ *
+ * Debe llamarse ANTES de sd_storage_close(), que desmonta las tarjetas.
+ *
+ * @param msg Texto a registrar.
+ * @return ESP_OK si se pudo escribir en al menos una tarjeta.
+ */
+esp_err_t sd_storage_write_error_log(const char *msg);
 
 /**
  * @brief Cierra el archivo de vuelo actual y desmonta la tarjeta.

@@ -18,9 +18,9 @@
 void spi_link_slave_init(void);
 
 /**
- * @brief Envía un paquete de datos rápidos (PKT_TYPE_FAST_DATA) al Maestro.
+ * @brief Acumula una muestra rápida. Cada 4 arma un paquete SPI.
  *
- * @param payload Puntero al payload de datos rápidos.
+ * @param payload Puntero a una muestra (timestamp propio + 16 canales).
  */
 void spi_link_slave_send_fast(const fast_data_payload_t *payload);
 

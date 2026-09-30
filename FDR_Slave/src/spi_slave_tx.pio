@@ -1,42 +1,63 @@
 .program spi_slave_tx
 
-; PIO SPI Slave TX: envía datos por MISO sincronizado al SCK del maestro
-; IN pin 0 = SCK (GP14)
-; OUT pin 0 = MISO/TX (GP15)
-; Autopull threshold = 8 bits
+; PIO SPI Slave TX: envía datos por MISO sincronizado al SCK del maestro.
 ;
-; Funcionamiento: espera flanco LOW de SCK, cambia bit en MISO,
-; espera flanco HIGH de SCK (maestro samplea). Repite.
+;   CS   = GP0 (entrada, desde el ESP32-S3)
+;   MISO = GP1 (salida, hacia el ESP32-S3)
+;   SCK  = GP2 (entrada, desde el ESP32-S3)
+;
+; Las instrucciones `wait ... gpio N` usan el índice ABSOLUTO del GPIO
+; (no el mapeo de in_base), por eso los pines van fijos acá. Se exportan
+; como PUBLIC para poder verificarlos contra pin_config.h en tiempo de
+; compilación desde spi_link_slave.c.
+;
+; El gating por CS es imprescindible: el maestro emite transacciones
+; dummy de 8 bits (trama despertador y "poke" de recuperación). Sin el
+; gating, esos pulsos de reloj consumen bytes del stream que el DMA está
+; cargando en el FIFO y desalinean el paquete entero.
+
+.define PUBLIC CS_GPIO  0
+.define PUBLIC SCK_GPIO 2
 
 .wrap_target
-  wait 0 pin 0     ; Esperar SCK LOW (cambiar dato)
-  out pins, 1      ; Poner siguiente bit en MISO
-  wait 1 pin 0     ; Esperar SCK HIGH (maestro samplea)
+idle:
+  wait 0 gpio CS_GPIO    ; Esperar CS LOW: inicio de transacción
+bitloop:
+  jmp pin idle           ; Si CS volvió a HIGH, abortar y volver a idle
+  wait 0 gpio SCK_GPIO   ; Esperar SCK LOW (momento de cambiar el dato)
+  out pins, 1            ; Poner el siguiente bit en MISO
+  wait 1 gpio SCK_GPIO   ; Esperar SCK HIGH (el maestro samplea)
+  jmp bitloop
 .wrap
 
 % c-sdk {
 static inline void spi_slave_tx_program_init(PIO pio, uint sm, uint offset,
-                                              uint miso_pin, uint sck_pin) {
-    // Configurar MISO como output del PIO
+                                             uint miso_pin, uint sck_pin,
+                                             uint cs_pin) {
+    // MISO: salida controlada por el PIO
     pio_gpio_init(pio, miso_pin);
-    pio_sm_set_consecutive_pindirs(pio, sm, miso_pin, 1, true);  // output
+    pio_sm_set_consecutive_pindirs(pio, sm, miso_pin, 1, true);
 
-    // Configurar SCK como input del PIO
+    // SCK: entrada
     pio_gpio_init(pio, sck_pin);
-    pio_sm_set_consecutive_pindirs(pio, sm, sck_pin, 1, false);  // input
+    pio_sm_set_consecutive_pindirs(pio, sm, sck_pin, 1, false);
+
+    // CS: entrada (usado por `wait gpio` y por `jmp pin`)
+    pio_gpio_init(pio, cs_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, cs_pin, 1, false);
 
     pio_sm_config c = spi_slave_tx_program_get_default_config(offset);
 
-    // OUT pin = MISO
     sm_config_set_out_pins(&c, miso_pin, 1);
-
-    // IN pin base = SCK (para las instrucciones wait)
     sm_config_set_in_pins(&c, sck_pin);
 
-    // Autopull cada 8 bits, shift MSB first
-    sm_config_set_out_shift(&c, false, true, 8);  // MSB first, autopull, 8 bits
+    // JMP PIN = CS, para poder abortar cuando el maestro suelta la línea
+    sm_config_set_jmp_pin(&c, cs_pin);
 
-    // Clock divider = 1 (máxima velocidad para seguir al maestro)
+    // Autopull cada 8 bits, MSB primero
+    sm_config_set_out_shift(&c, false, true, 8);
+
+    // Sin divisor: el PIO corre a sys_clk para seguir al maestro
     sm_config_set_clkdiv(&c, 1.0f);
 
     pio_sm_init(pio, sm, offset, &c);

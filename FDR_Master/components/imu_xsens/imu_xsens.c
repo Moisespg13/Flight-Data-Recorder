@@ -71,6 +71,11 @@ static uint8_t s_data_buf[MT_MAX_FRAME];
 static uint8_t s_data_pos = 0;
 static uint8_t s_checksum = 0;
 
+// s_data_len es uint8_t, así que el buffer tiene que cubrir hasta 255 bytes
+// para que PARSE_DATA no pueda desbordarlo con ninguna trama posible.
+_Static_assert(sizeof(s_data_buf) > UINT8_MAX,
+               "s_data_buf debe cubrir todo el rango de s_data_len");
+
 // Último dato parseado
 static imu_payload_t s_imu_data = {0};
 static bool s_data_valid = false;

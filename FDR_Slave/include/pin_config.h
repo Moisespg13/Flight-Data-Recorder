@@ -8,7 +8,7 @@
  *
  * Asignación de buses:
  *   - GP0-GP3:  Enlace inter-placa (PIO, Slave) -> Comunicación con ESP32-S3
- *   - GP4-GP7:  Bus de ADQUISICIÓN (SPI0, Master) -> AD7606, AD4131
+ *   - GP4-GP7:  Bus de ADQUISICIÓN (SPI0, Master) -> AD7606 x2, AD7490
  *   - GP8-GP15: Señales de control y sincronización
  *   - GP26-GP29: ADC control / sincronización
  *
@@ -37,7 +37,8 @@
 #define PIN_ADC_RST       15  // GP15 - Reset (compartido)
 
 // Señales de control del AD7490 (ADC lento)
-// (No requiere DRDY)
+// (No requiere DRDY: la conversión arranca con el flanco de bajada de CS)
+// GP29 quedó libre al reemplazar el AD4131 por el AD7490.
 
 // ============================================================================
 // ENLACE INTER-PLACA (RP2040 como Slave <- ESP32-S3, vía PIO)
@@ -68,9 +69,9 @@
 // ============================================================================
 // DATA READY (Slave -> Master)
 // ============================================================================
-#define PIN_DRDY          3   // GP3  - Señal DRDY: HIGH = paquete listo para leer
+#define PIN_DRDY          3   // GP3  - Señal DRDY inter-placa (ex MOSI del bus)
 
 // ============================================================================
 // PINES LIBRES (reservados para uso futuro)
 // ============================================================================
-// GP11 - Libre
+// GP11, GP29 - Libres

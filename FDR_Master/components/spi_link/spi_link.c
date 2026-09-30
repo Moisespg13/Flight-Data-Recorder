@@ -5,14 +5,18 @@
  *
  * Protocolo de 3 pasos con el Esclavo (RP2040):
  *
- *   1. Master espera DRDY HIGH (GPIO45) → Slave tiene datos listos
- *   2. Master hace spi_device_transmit (174 bytes @ 8MHz ≈ 175µs)
+ *   1. Master espera DRDY HIGH → Slave tiene datos listos
+ *   2. Master hace spi_device_transmit de un paquete completo (58 bytes)
  *   3. Master espera DRDY LOW → Slave confirmó fin de transacción
  *   4. Repetir
  *
- * GPIO45 es STRAP pin (VDD_SPI voltage select). Es seguro como input
- * porque el pull-down interno del ESP32-S3 lo mantiene LOW al boot,
- * y el RP2040 no aserta DRDY hasta recibir SYNC_TRIG post-boot.
+ * El pin de DRDY sale de pin_config.h y el reloj del bus de spi_manager.c;
+ * este archivo es idéntico en el árbol de producción y en el testbench.
+ *
+ * La espera del paso 1 es por interrupción (flanco ascendente de DRDY) y
+ * no por sondeo: esta tarea corre fijada al core 1 y un bucle de sondeo
+ * dejaba sin CPU a IDLE1 (disparando el Task WDT) y a cualquier otra
+ * tarea fijada a ese core.
  */
 
 #include "spi_link.h"
@@ -20,6 +24,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -35,107 +40,254 @@ static const char *TAG = "SPI_LINK";
 static QueueHandle_t s_fast_queue = NULL;
 static QueueHandle_t s_slow_queue = NULL;
 
-// Tamaño de un paquete completo (el más grande)
+static TaskHandle_t s_link_task = NULL;
+
+// Tamaño de un paquete completo (el más grande: lote rápido de 4 o un lento)
 #define MAX_PKT_LEN (sizeof(fdr_header_t) + \
-    ((sizeof(fast_data_payload_t) > sizeof(slow_data_payload_t)) \
-         ? sizeof(fast_data_payload_t) \
+    ((sizeof(fast_data_spi_payload_t) > sizeof(slow_data_payload_t)) \
+         ? sizeof(fast_data_spi_payload_t) \
          : sizeof(slow_data_payload_t)) + 4)
 
-// Buffer SPI: ahora se lee exactamente un paquete (58 bytes) gracias a la sincronización CS/DRDY
+// Buffer SPI: un paquete lento son 58 bytes; uno rápido, 178.
 #define SPI_RX_BUF_SIZE (MAX_PKT_LEN)
 
 DMA_ATTR static uint8_t rx_buffer[SPI_RX_BUF_SIZE];
 
-// Contadores de throughput
-static uint32_t s_tp_fast_count = 0;
-static int64_t  s_tp_last_us = 0;
+// Si DRDY no sube en este tiempo, el esclavo puede haberse reiniciado y
+// estar esperando un flanco de bajada de CS: le mandamos una trama vacía.
+#define DRDY_TIMEOUT_MS 50
 
-// Timeout para DRDY: si no sube/baja en este tiempo, logear warning
-#define DRDY_TIMEOUT_US 50000  // 50ms
+// ============================================================================
+// Métricas del enlace
+// ============================================================================
+// Estos contadores son la evidencia de integridad del enlace: sin ellos no
+// hay forma de cuantificar cuántas muestras se perdieron durante un vuelo.
+typedef struct {
+  uint32_t tx_total;      // Transacciones SPI iniciadas
+  uint32_t pkt_ok;        // Paquetes con magic + CRC válidos
+  uint32_t pkt_bad;       // Transacciones sin ningún paquete válido
+  uint32_t drdy_timeouts; // Vencimientos esperando DRDY
+  uint32_t drdy_stale;    // Flancos cuyo dato ya no estaba en oferta
+  uint32_t dup_fast;      // Paquetes rápidos repetidos (misma secuencia)
+  uint32_t dup_slow;      // Paquetes lentos repetidos (misma secuencia)
+  uint32_t lost_fast;     // Paquetes rápidos perdidos (salto de secuencia)
+  uint32_t lost_slow;     // Paquetes lentos perdidos (salto de secuencia)
+  uint32_t drop_fast;     // Paquetes rápidos descartados por cola llena
+  uint32_t drop_slow;     // Paquetes lentos descartados por cola llena
+} link_stats_t;
+
+static link_stats_t s_stats = {0};
+
+// Seguimiento de secuencia por tipo de paquete
+static uint16_t s_last_seq_fast = 0;
+static uint16_t s_last_seq_slow = 0;
+static bool s_seq_fast_init = false;
+static bool s_seq_slow_init = false;
+
+// Throughput
+static uint32_t s_tp_fast_count = 0;
+static int64_t s_tp_last_us = 0;
+
+/**
+ * @brief Cuenta los paquetes faltantes entre dos números de secuencia.
+ *
+ * La resta en uint16_t maneja el wrap de 65535 a 0 sin caso especial.
+ */
+static uint32_t seq_gap(uint16_t last, uint16_t current) {
+  return (uint32_t)(uint16_t)(current - last - 1);
+}
+
+// ============================================================================
+// ISR de DRDY
+// ============================================================================
+static void IRAM_ATTR drdy_isr_handler(void *arg) {
+  (void)arg;
+  BaseType_t higher_woken = pdFALSE;
+  if (s_link_task != NULL) {
+    vTaskNotifyGiveFromISR(s_link_task, &higher_woken);
+  }
+  if (higher_woken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+/**
+ * @brief Transacción vacía para forzar un flanco de CS.
+ *
+ * Si el esclavo arrancó tarde o se reinició, está esperando un flanco de
+ * bajada de CS para sincronizarse. El gating por CS del PIO garantiza que
+ * estos pulsos no le roben bytes al stream del próximo paquete.
+ */
+static void poke_slave(spi_device_handle_t spi_dev) {
+  spi_transaction_t t;
+  memset(&t, 0, sizeof(t));
+  t.length = 8;
+  spi_device_transmit(spi_dev, &t);
+}
+
+/**
+ * @brief Espera a que el esclavo ofrezca un paquete, durmiendo hasta la ISR.
+ *
+ * Sincroniza por FLANCO de DRDY, no por nivel. El esclavo baja DRDY en su ISR
+ * de CS y la vuelve a subir en cuanto arma el paquete siguiente, así que el
+ * pulso bajo puede ser más corto que el procesamiento del maestro y no se
+ * puede usar el nivel para delimitar transacciones: esperar a ver DRDY en LOW
+ * lleva a que el maestro espere una bajada que ya pasó mientras el esclavo
+ * espera un CS que no llega.
+ *
+ * Cada flanco ascendente incrementa la notificación. Se consume de a uno
+ * (xClearCountOnExit = pdFALSE) para no perder flancos que hayan llegado
+ * mientras procesábamos el paquete anterior.
+ *
+ * @return true si hay un paquete en oferta, false si hay que reintentar.
+ */
+static bool wait_drdy_edge(spi_device_handle_t spi_dev) {
+  if (ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(DRDY_TIMEOUT_MS)) == 0) {
+    s_stats.drdy_timeouts++;
+    if (s_stats.drdy_timeouts <= 10 || s_stats.drdy_timeouts % 1000 == 0) {
+      ESP_LOGW(TAG, "Sin flanco de DRDY en %d ms (timeout #%lu)",
+               DRDY_TIMEOUT_MS, (unsigned long)s_stats.drdy_timeouts);
+    }
+    poke_slave(spi_dev);
+    return false;
+  }
+
+  // El flanco dice que hubo un paquete; el nivel dice si sigue en oferta. Si
+  // el esclavo ya lo retiró (por su propio timeout de 10 ms), no tiene sentido
+  // clockear: lo contamos y esperamos el flanco siguiente.
+  if (gpio_get_level(PIN_SPI_DRDY) == 0) {
+    s_stats.drdy_stale++;
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * @brief Encola un payload y contabiliza descartes y saltos de secuencia.
+ */
+static void dispatch_packet(const fdr_header_t *hdr, const uint8_t *payload) {
+  switch (hdr->type) {
+  case PKT_TYPE_FAST_DATA:
+    if (s_fast_queue == NULL || hdr->length != sizeof(fast_data_spi_payload_t)) {
+      break;
+    }
+    if (s_seq_fast_init) {
+      if (hdr->sequence == s_last_seq_fast) {
+        s_stats.dup_fast++;
+        break;
+      }
+      s_stats.lost_fast +=
+          seq_gap(s_last_seq_fast, hdr->sequence) * FAST_SAMPLES_PER_SPI_PKT;
+    }
+    s_last_seq_fast = hdr->sequence;
+    s_seq_fast_init = true;
+
+    {
+      const fast_data_spi_payload_t *batch =
+          (const fast_data_spi_payload_t *)payload;
+      for (int i = 0; i < FAST_SAMPLES_PER_SPI_PKT; i++) {
+        if (xQueueSend(s_fast_queue, &batch->samples[i], 0) != pdPASS) {
+          s_stats.drop_fast++;
+        }
+      }
+    }
+    s_tp_fast_count++;
+    break;
+
+  case PKT_TYPE_SLOW_DATA:
+    if (s_slow_queue == NULL || hdr->length != sizeof(slow_data_payload_t)) {
+      break;
+    }
+    if (s_seq_slow_init) {
+      if (hdr->sequence == s_last_seq_slow) {
+        s_stats.dup_slow++;
+        break;
+      }
+      s_stats.lost_slow += seq_gap(s_last_seq_slow, hdr->sequence);
+    }
+    s_last_seq_slow = hdr->sequence;
+    s_seq_slow_init = true;
+
+    if (xQueueSend(s_slow_queue, payload, 0) != pdPASS) {
+      s_stats.drop_slow++;
+    }
+    break;
+
+  default:
+    break;
+  }
+}
 
 static void tsk_spi_link_master(void *pvParameters) {
-  ESP_LOGI(TAG, "Tarea SPI Link Maestro Iniciada (DRDY handshake, GPIO%d)",
+  ESP_LOGI(TAG, "Tarea SPI Link Maestro Iniciada (DRDY por ISR, GPIO%d)",
            PIN_SPI_DRDY);
+
+  // Publicamos el handle antes de registrar la ISR para que no exista una
+  // ventana en la que la interrupción dispare sin destinatario.
+  s_link_task = xTaskGetCurrentTaskHandle();
 
   spi_device_handle_t spi_dev = spi_manager_get_master_handle();
   if (spi_dev == NULL) {
     ESP_LOGE(TAG, "Handle SPI Maestro no disponible!");
+    s_link_task = NULL;
     vTaskDelete(NULL);
     return;
   }
 
-  // Configurar como input para DRDY
+  // DRDY: entrada con pull-down (idle = LOW) e interrupción por flanco
+  // ascendente.
   gpio_config_t drdy_cfg = {
       .pin_bit_mask = (1ULL << PIN_SPI_DRDY),
       .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
-      .pull_down_en = GPIO_PULLDOWN_ENABLE,  // Pull-down: DRDY idle = LOW
-      .intr_type = GPIO_INTR_DISABLE,
+      .pull_down_en = GPIO_PULLDOWN_ENABLE,
+      .intr_type = GPIO_INTR_POSEDGE,
   };
   gpio_config(&drdy_cfg);
+
+  // El servicio de ISR de GPIO lo instala master_logic_start() una única vez.
+  // Instalarlo acá también hace que el driver logee un error a nivel E cada
+  // vez que se lo llama de más, aunque el resultado sea correcto.
+  esp_err_t isr_ret = gpio_isr_handler_add(PIN_SPI_DRDY, drdy_isr_handler, NULL);
+  if (isr_ret != ESP_OK) {
+    ESP_LOGE(TAG, "No se pudo registrar la ISR de DRDY: %s",
+             esp_err_to_name(isr_ret));
+  }
 
   ESP_LOGI(TAG, "MAX_PKT_LEN=%d, SPI_RX_BUF_SIZE=%d, DRDY=GPIO%d",
            (int)MAX_PKT_LEN, (int)SPI_RX_BUF_SIZE, PIN_SPI_DRDY);
 
-  // Verificar estado inicial de DRDY
   int drdy_init = gpio_get_level(PIN_SPI_DRDY);
   ESP_LOGI(TAG, "DRDY estado inicial: %s",
-           drdy_init ? "HIGH (⚠️ Slave ya tiene datos?)" : "LOW (OK, esperado)");
+           drdy_init ? "HIGH (Slave ya tiene datos?)" : "LOW (OK, esperado)");
 
   spi_transaction_t t;
-  uint32_t ok_count = 0;
-  uint32_t fail_count = 0;
-  uint32_t total_tx = 0;
-  uint32_t drdy_timeout_count = 0;
 
-  // Registrar en el supervisor (timeout 5 segundos)
   supervisor_register(TASK_ID_SPI_LINK, "spi_link", 5000);
 
-  // Esperar a que el Slave arranque
-  ESP_LOGI(TAG, "Esperando 500ms para que el Slave arranque...");
+  ESP_LOGI(TAG, "Esperando 500 ms para que el Slave arranque...");
   vTaskDelay(pdMS_TO_TICKS(500));
 
-  // Trama Despertador (Dummy transaction para bajar el CS y despertar al esclavo)
   ESP_LOGI(TAG, "Enviando Trama Despertador al Esclavo...");
-  memset(&t, 0, sizeof(t));
-  t.length = 8; // 8 bits dummy
-  spi_device_transmit(spi_dev, &t);
+  poke_slave(spi_dev);
+
+  // Descartar los flancos acumulados durante el arranque para que el conteo
+  // arranque alineado con el primer paquete real.
+  ulTaskNotifyTake(pdTRUE, 0);
 
   while (1) {
     // ================================================================
-    // PASO 1: Esperar DRDY HIGH (Slave tiene datos listos)
+    // PASO 1: Esperar el flanco de DRDY (bloqueante, 0% CPU)
     // ================================================================
-    int64_t wait_start = esp_timer_get_time();
-    while (1) {
-      if (gpio_get_level(PIN_SPI_DRDY) == 1) {
-        esp_rom_delay_us(2); // Debounce de crosstalk
-        if (gpio_get_level(PIN_SPI_DRDY) == 1) break; // DRDY real
-      }
-
-      int64_t elapsed = esp_timer_get_time() - wait_start;
-      if (elapsed > DRDY_TIMEOUT_US) {
-        drdy_timeout_count++;
-        if (drdy_timeout_count <= 10 || drdy_timeout_count % 1000 == 0) {
-          ESP_LOGW(TAG, "DRDY no subió en %dms (timeout #%lu)",
-                   (int)(DRDY_TIMEOUT_US / 1000),
-                   (unsigned long)drdy_timeout_count);
-        }
-        
-        // POKE AL ESCLAVO: Si el esclavo se reinició o prendió tarde, estará
-        // esperando un flanco de bajada en el CS. Le mandamos una trama vacía.
-        memset(&t, 0, sizeof(t));
-        t.length = 8;
-        spi_device_transmit(spi_dev, &t);
-
-        wait_start = esp_timer_get_time(); // Reset para no spamear
-        vTaskDelay(pdMS_TO_TICKS(1)); // Liberar CPU 1ms para resetear el Watchdog (TWDT)
-      }
+    if (!wait_drdy_edge(spi_dev)) {
+      continue;
     }
 
     // ================================================================
-    // PASO 2: Transacción SPI (174 bytes @ 8MHz ≈ 175µs)
+    // PASO 2: Transacción SPI (un paquete completo)
     // ================================================================
-    total_tx++;
+    s_stats.tx_total++;
 
     memset(&t, 0, sizeof(t));
     t.length = SPI_RX_BUF_SIZE * 8;
@@ -148,19 +300,12 @@ static void tsk_spi_link_master(void *pvParameters) {
       continue;
     }
 
-    // ================================================================
-    // PASO 3: Micro-gap de seguridad (2µs)
-    // ================================================================
-    // spi_device_transmit() ya tiene ~20µs de overhead al retornar,
-    // tiempo más que suficiente para que el Slave detecte CS HIGH y
-    // baje DRDY. Agregamos 2µs de hardware delay solo por paranoia.
-    // No esperamos activamente por DRDY LOW porque si el Slave está
-    // atrasado, bajará y subirá DRDY tan rápido que el Master se lo
-    // perdería y quedaría colgado en un timeout.
+    // Micro-gap: spi_device_transmit() ya tiene ~20 µs de overhead al
+    // retornar, de sobra para que el esclavo vea CS HIGH y baje DRDY.
     esp_rom_delay_us(2);
 
     // ================================================================
-    // PASO 4: Buscar paquete válido (Magic + CRC)
+    // PASO 3: Buscar paquete válido (Magic + CRC)
     // ================================================================
     bool found = false;
     for (int i = 0; i <= (int)SPI_RX_BUF_SIZE - (int)sizeof(fdr_header_t); i++) {
@@ -179,44 +324,20 @@ static void tsk_spi_link_master(void *pvParameters) {
       if (crc_rx != crc_calc) continue;
 
       // ¡Paquete válido!
-      const uint8_t *payload_ptr = &rx_buffer[i + sizeof(fdr_header_t)];
-      ok_count++;
+      s_stats.pkt_ok++;
       supervisor_checkin(TASK_ID_SPI_LINK);
-
-      if (ok_count % 3000 == 0) {
-        ESP_LOGI(TAG, "PKT OK #%lu type=0x%02X seq=%u (tx=%lu, hit=%.0f%%)",
-                 (unsigned long)ok_count, hdr->type, hdr->sequence,
-                 (unsigned long)total_tx,
-                 (float)ok_count * 100.0f / (float)total_tx);
-      }
-
-      switch (hdr->type) {
-      case PKT_TYPE_FAST_DATA:
-        if (s_fast_queue && hdr->length == sizeof(fast_data_payload_t)) {
-          xQueueSend(s_fast_queue, payload_ptr, 0);
-          s_tp_fast_count++;
-        }
-        break;
-      case PKT_TYPE_SLOW_DATA:
-        if (s_slow_queue && hdr->length == sizeof(slow_data_payload_t))
-          xQueueSend(s_slow_queue, payload_ptr, 0);
-        break;
-      }
+      dispatch_packet(hdr, &rx_buffer[i + sizeof(fdr_header_t)]);
 
       found = true;
       i += data_len + 4 - 1;
     }
 
     if (!found) {
-      fail_count++;
+      s_stats.pkt_bad++;
     }
 
-    // ================================================================
-    // PASO 5: Esperar DRDY LOW (Esclavo confirmó fin)
-    // ================================================================
-    while (gpio_get_level(PIN_SPI_DRDY) == 1) {
-      esp_rom_delay_us(1);
-    }
+    // No se espera a ver DRDY en LOW: el flanco ascendente siguiente es lo que
+    // delimita el próximo paquete (ver wait_drdy_edge).
 
     // Log de throughput cada 5 segundos
     int64_t now_us = esp_timer_get_time();
@@ -224,9 +345,20 @@ static void tsk_spi_link_master(void *pvParameters) {
     if (now_us - s_tp_last_us >= 5000000) {
       float rate = (float)s_tp_fast_count /
                    ((float)(now_us - s_tp_last_us) / 1000000.0f);
-      ESP_LOGI(TAG, "THROUGHPUT: %.0f fast pkts/sec (ok=%lu fail=%lu tx=%lu drdy_to=%lu)",
-               rate, (unsigned long)ok_count, (unsigned long)fail_count,
-               (unsigned long)total_tx, (unsigned long)drdy_timeout_count);
+      ESP_LOGI(TAG,
+               "THROUGHPUT: %.0f fast pkt/s | tx=%lu ok=%lu bad=%lu | "
+               "perdidos f=%lu s=%lu | repetidos f=%lu s=%lu | "
+               "descartados f=%lu s=%lu | drdy_to=%lu drdy_stale=%lu",
+               rate, (unsigned long)s_stats.tx_total,
+               (unsigned long)s_stats.pkt_ok, (unsigned long)s_stats.pkt_bad,
+               (unsigned long)s_stats.lost_fast,
+               (unsigned long)s_stats.lost_slow,
+               (unsigned long)s_stats.dup_fast,
+               (unsigned long)s_stats.dup_slow,
+               (unsigned long)s_stats.drop_fast,
+               (unsigned long)s_stats.drop_slow,
+               (unsigned long)s_stats.drdy_timeouts,
+               (unsigned long)s_stats.drdy_stale);
       s_tp_fast_count = 0;
       s_tp_last_us = now_us;
     }
@@ -249,12 +381,14 @@ esp_err_t spi_link_init(QueueHandle_t q_rx_fast, QueueHandle_t q_rx_slow) {
 }
 
 esp_err_t spi_link_start(void) {
+  // Prioridad alta pero no máxima: la tarea ahora duerme esperando la ISR de
+  // DRDY, así que no necesita monopolizar el planificador del core 1.
   BaseType_t ok = xTaskCreatePinnedToCore(
       tsk_spi_link_master, "tsk_spi_link",
       4096, NULL,
-      configMAX_PRIORITIES - 1,  // Prioridad máxima
+      12,
       NULL,
-      1);  // Core 1 dedicado
+      1);  // Core 1, aislado de la escritura a SD
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "Error al crear tarea SPI Link Maestro");
     return ESP_ERR_NO_MEM;

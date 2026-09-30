@@ -12,7 +12,8 @@
  *                                     y deposita los datos en q_slow_data.
  *   Prio 6 - tsk_spi_link_slave:     Recibe datos de ambas colas, empaqueta
  *                                     con Header + CRC, y transmite al Maestro
- *                                     vía SPI1 (Slave mode).
+ *                                     por PIO (SPI slave por software, ver
+ *                                     spi_slave_tx.pio).
  *   Prio 6 - tsk_time_sync_slave:    Recalibra el timestamp local usando
  *                                     el pulso PPS del Maestro/GNSS.
  *

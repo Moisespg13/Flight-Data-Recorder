@@ -8,6 +8,8 @@ Herramienta de post-proceso para archivos de vuelo del FDR (CEV-FAA / IUA).
 - Decodifica el formato CEV de sub-conmutación (Formato 1, 2 o 3 — autodetectado desde el header).
 - Exporta los datos a `.csv` con una columna por parámetro y una fila por ciclo.
 - Muestra gráficos interactivos con zoom/pan para análisis en tierra.
+- Lee el `.bin` por bloques (una barra abajo muestra los MB leídos). Por encima de 40 MB no genera el CSV solo: hay que usar **Guardar CSV**.
+- En Configuración, **Leer del FDR** y **Guardar en el FDR** mandan los comandos 3 y 2 por el UART de comandos. El formato queda en la NVS y se usa al reiniciar el equipo, no en la grabación ya abierta.
 
 ## Uso en el hangar (sin internet)
 
@@ -30,7 +32,9 @@ Herramienta de post-proceso para archivos de vuelo del FDR (CEV-FAA / IUA).
 | `DSP_7` … `DSP_9` | Magnetómetro X/Y/Z (a.u.) |
 | `DSP_10`, `DSP_11` | Roll, Pitch (°) |
 | `DSP_12` | Señal PPS Sync (0/1) |
+| `DSP_13` | Yaw / guiñada (°) |
 | `DIA`, `MES`, `ANO`, `HOR`, `MIN`, `SEG` | Timestamp GNSS |
+| `LAT`, `LON`, `ALT` | Posición GNSS reconstruida (grados y pies) |
 
 ## Compilar el .exe (solo si necesitás regenerarlo)
 
