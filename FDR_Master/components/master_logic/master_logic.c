@@ -63,21 +63,22 @@ static QueueHandle_t q_rx_slow = NULL;
 // ============================================================================
 // Buffer temporal para frames CEV (máximo 17 words × 2 bytes = 34 bytes)
 // ============================================================================
-static int16_t s_frame_buf[FMT1_WORDS_PER_FRAME]; // 17 = máximo posible
 
 // Ticks en los que el ensamblador no llegó a tiempo
 static uint32_t s_writer_overruns = 0;
 
 // Anillo en PSRAM. 2 MB ≈ 20 s de formato 1 (~100 KB/s). Absorbe el fsync
 // de las dos SD sin frenar el ensamblado. El chunk de copia queda en SRAM.
-#define SD_RING_BYTES (2 * 1024 * 1024)
-#define SD_IO_CHUNK   (16 * 1024)
-
+// Anillo de bytes en PSRAM: 6 MB ≈ 60 s a ~100 KB/s (F1).
+// Absorbe borrados internos y Garbage Collection de la MicroSD.
+#define SD_RING_BYTES (6 * 1024 * 1024)
+#define SD_IO_CHUNK   (32 * 1024)
 // fsync desfasado: nunca las dos SD a la vez.
-// SD1: 2, 4, 6… min  |  SD2: 3, 5, 7… min
-#define SD_SYNC_PERIOD_US (2LL * 60LL * 1000000LL)
-#define SD1_FIRST_SYNC_US (2LL * 60LL * 1000000LL)
-#define SD2_FIRST_SYNC_US (3LL * 60LL * 1000000LL)
+// SD1: 5, 10, 15… min  |  SD2: 7.5, 12.5, 17.5… min
+// Si el anillo supera el 50%, se pospone el siguiente 60 s.
+#define SD_SYNC_PERIOD_US   (5LL * 60LL * 1000000LL)
+#define SD1_FIRST_SYNC_US   (5LL * 60LL * 1000000LL)
+#define SD2_FIRST_SYNC_US   (7LL * 60LL * 1000000LL + 30LL * 1000000LL)
 #define SD_SYNC_POSTPONE_US (60LL * 1000000LL)
 static uint8_t *s_sd_ring = NULL;
 static uint8_t *s_sd_chunk = NULL;
@@ -87,6 +88,7 @@ static size_t s_ring_used = 0;
 static SemaphoreHandle_t s_ring_mtx = NULL;
 static TaskHandle_t s_sd_task = NULL;
 static volatile bool s_sd_stop = false;
+static uint32_t s_ring_drops = 0;
 
 // Contador de frames dentro del ciclo (0..39 para F1/F2, 0..9 para F3)
 static uint8_t s_frame_counter = 0;
@@ -148,10 +150,12 @@ static bool ring_push(const uint8_t *data, size_t len) {
     return false;
   }
   if (xSemaphoreTake(s_ring_mtx, pdMS_TO_TICKS(20)) != pdTRUE) {
+    s_ring_drops++;
     return false;
   }
   if (s_ring_used + len > SD_RING_BYTES) {
     xSemaphoreGive(s_ring_mtx);
+    s_ring_drops++;
     return false;
   }
   size_t first = SD_RING_BYTES - s_ring_w;
@@ -213,7 +217,7 @@ static size_t ring_used(void) {
 // Core 0: único lugar que toca la SD. El ensamblador sigue en el core 1.
 static void tsk_sd_writer(void *pvParameters) {
   (void)pvParameters;
-  ESP_LOGI(TAG, "SD writer iniciado (prio 6, core 0, anillo PSRAM %u KB, fsync SD1@2m SD2@3m)",
+  ESP_LOGI(TAG, "SD writer iniciado (prio 6, core 0, anillo PSRAM %u KB, fsync SD1@5m SD2@7.5m cada 5m)",
            (unsigned)(SD_RING_BYTES / 1024));
   uint8_t *chunk = s_sd_chunk;
   if (chunk == NULL) {
@@ -224,69 +228,84 @@ static void tsk_sd_writer(void *pvParameters) {
   const int64_t t0 = esp_timer_get_time();
   int64_t next_sync1_us = t0 + SD1_FIRST_SYNC_US;
   int64_t next_sync2_us = t0 + SD2_FIRST_SYNC_US;
+  int64_t last_write_us = t0;
+  uint32_t bytes_out = 0;
 
   while (1) {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+    int64_t now_us = esp_timer_get_time();
+    size_t used = ring_used();
+    bool sync1_due = (now_us >= next_sync1_us);
+    bool sync2_due = (now_us >= next_sync2_us);
+    bool timeout_flush = (used > 0 && (now_us - last_write_us >= 500000LL));
 
-    size_t n;
-    while ((n = ring_pop(chunk, SD_IO_CHUNK)) > 0) {
-      if (s_recording_aborted) {
-        continue;
+    // Escribir a SD si se acumuló al menos 1 clúster completo (32 KB = SD_IO_CHUNK),
+    // o si hay que vaciar el remanente antes de un fsync, por power-loss,
+    // o por timeout de inactividad (500 ms).
+    if (used >= SD_IO_CHUNK || (used > 0 && (s_sd_stop || sync1_due || sync2_due || timeout_flush))) {
+      size_t to_pop = (used >= SD_IO_CHUNK) ? SD_IO_CHUNK : used;
+      size_t n = ring_pop(chunk, to_pop);
+      if (n > 0) {
+        if (!s_recording_aborted) {
+          if (sd_storage_write(chunk, n) != ESP_OK) {
+            ESP_LOGE(TAG, "Error crítico: Fallo de escritura en ambas SD "
+                          "(posible SD llena). Abortando grabación.");
+            s_recording_aborted = true;
+            led_set_mode(LED_MODE_FLIGHT_ERROR);
+            sd_storage_write_error_log(
+                "Falla en Modo Vuelo: SD llena o error de I/O.");
+            sd_storage_close();
+          } else {
+            bytes_out += (uint32_t)n;
+            last_write_us = esp_timer_get_time();
+          }
+        }
       }
-      if (sd_storage_write(chunk, n) != ESP_OK) {
-        ESP_LOGE(TAG, "Error crítico: Fallo de escritura en ambas SD "
-                      "(posible SD llena). Abortando grabación.");
-        s_recording_aborted = true;
-        led_set_mode(LED_MODE_FLIGHT_ERROR);
-        sd_storage_write_error_log(
-            "Falla en Modo Vuelo: SD llena o error de I/O.");
-        sd_storage_close();
-      }
+    } else if (!s_sd_stop && !sync1_due && !sync2_due) {
+      // Esperar hasta 50 ms a que carguen más datos en el anillo
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
     }
 
     if (s_sd_stop && ring_used() == 0) {
       ESP_LOGW(TAG, "Power-loss: anillo vacío, fsync y cierre");
-      sd_storage_flush();
+      sd_storage_flush_1();
+      sd_storage_flush_2();
       sd_storage_close();
       ESP_LOGW(TAG, "*** Archivo cerrado exitosamente. Sistema seguro. ***");
       vTaskSuspend(NULL);
     }
 
-    int64_t now_us = esp_timer_get_time();
-    bool ring_busy = ring_used() > (SD_RING_BYTES / 2);
+    now_us = esp_timer_get_time();
+    used = ring_used();
+    bool ring_busy = (used > (SD_RING_BYTES / 2));
+
+    // Sincronización periódica SD1 (cada 5 min)
     if (now_us >= next_sync1_us) {
       if (ring_busy) {
         next_sync1_us = now_us + SD_SYNC_POSTPONE_US;
         ESP_LOGW(TAG, "fsync SD1 pospuesto (anillo ocupado)");
       } else {
         sd_storage_flush_1();
-        next_sync1_us += SD_SYNC_PERIOD_US;
-        ESP_LOGI(TAG, "fsync SD1");
+        next_sync1_us = now_us + SD_SYNC_PERIOD_US;
+        ESP_LOGI(TAG, "fsync SD1: %lu bytes al disco, drops_anillo=%lu",
+                 (unsigned long)bytes_out, (unsigned long)s_ring_drops);
       }
-    } else if (now_us >= next_sync2_us) {
+    }
+
+    // Sincronización periódica SD2 (desfasada 2.5 min respecto a SD1)
+    if (now_us >= next_sync2_us) {
       if (ring_busy) {
         next_sync2_us = now_us + SD_SYNC_POSTPONE_US;
         ESP_LOGW(TAG, "fsync SD2 pospuesto (anillo ocupado)");
       } else {
         sd_storage_flush_2();
-        next_sync2_us += SD_SYNC_PERIOD_US;
-        ESP_LOGI(TAG, "fsync SD2");
+        next_sync2_us = now_us + SD_SYNC_PERIOD_US;
+        ESP_LOGI(TAG, "fsync SD2: %lu bytes al disco, drops_anillo=%lu",
+                 (unsigned long)bytes_out, (unsigned long)s_ring_drops);
       }
     }
   }
 }
 
-// ============================================================================
-// Tarea: Ensamblado de Frames CEV (Prioridad 9, core 1)
-// ============================================================================
-/**
- * La tasa depende del formato activo:
- *   F1/F2: cada 1 ms ensambla 3 frames (= 3000 frames/seg)
- *   F3:    cada 10 ms ensambla 1 frame (= 100 frames/seg)
- *
- * Cada frame es un bloque de N words de 16 bits, copiado al anillo de PSRAM.
- * No se descarta un frame: un hueco desalinea el archivo para siempre.
- */
 static void tsk_frame_assembler(void *pvParameters) {
   ESP_LOGI(TAG, "Tarea de Ensamblado CEV Iniciada (Prio 9, core 1)");
 
@@ -317,18 +336,22 @@ static void tsk_frame_assembler(void *pvParameters) {
       vTaskSuspend(NULL);
     }
 
+    int16_t tick_frames_buf[4 * FMT1_WORDS_PER_FRAME];
+    size_t tick_bytes = 0;
     for (int f = 0; f < frames_per_tick; f++) {
-      int words = sample_format_assemble_frame(s_frame_counter, s_frame_buf);
-
-      if (words > 0 && !s_recording_aborted) {
-        while (!ring_push((const uint8_t *)s_frame_buf, frame_bytes)) {
-          vTaskDelay(pdMS_TO_TICKS(2));
-        }
+      int words = sample_format_assemble_frame(s_frame_counter, tick_frames_buf + (f * words_per_frame));
+      if (words > 0) {
+        tick_bytes += frame_bytes;
       }
-
       s_frame_counter++;
       if (s_frame_counter >= frames_per_cycle) {
         s_frame_counter = 0;
+      }
+    }
+
+    if (tick_bytes > 0 && !s_recording_aborted) {
+      while (!ring_push((const uint8_t *)tick_frames_buf, tick_bytes)) {
+        vTaskDelay(pdMS_TO_TICKS(2));
       }
     }
 
@@ -484,6 +507,9 @@ static void tsk_discrete_master(void *pvParameters) {
       // Siempre actualizar el buffer compartido (el frame writer
       // lee el último valor cuando arma el frame con DIG)
       sample_format_update_discrete(current_states);
+      for (int i = 0; i < 16; i++) {
+        cmd_port_update_channel(32 + i, (int16_t)((current_states >> i) & 0x1));
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(50)); // 20 Hz

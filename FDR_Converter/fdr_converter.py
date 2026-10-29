@@ -150,6 +150,25 @@ GNSS_POS_COLS = ["LAT", "LON", "ALT"]               # GPS position (reconstruido
 CSV_COLUMNS  = (["ciclo", "tiempo_s"] + ANA_COLS + DIG_COLS +
                 DSP_COLS + TIME_COLS + GNSS_POS_COLS)
 
+# Mapa CMD 1 (debe coincidir con cmd_port.c)
+CMD_CH_COUNT = 72
+CMD_CH_DSP_1 = 48
+CMD_CH_DIA   = 61
+CMD_CH_LAT_H = 67
+CMD_CH_LAT_L = 68
+CMD_CH_LON_H = 69
+CMD_CH_LON_L = 70
+CMD_CH_ALT   = 71
+
+TIME_LABELS = {
+    "DIA": "Día GNSS",
+    "MES": "Mes GNSS",
+    "ANO": "Año GNSS",
+    "HOR": "Hora GNSS",
+    "MIN": "Minuto GNSS",
+    "SEG": "Segundo GNSS",
+}
+
 # ==============================================================================
 # Detección de unidades removibles (Windows)
 # ==============================================================================
@@ -297,80 +316,93 @@ def _parse_fdr_data(f, file_size, cev_format, data_offset, progress_cb=None):
 
     data_bytes = file_size - data_offset
     words_per_cycle = frames_per_cycle * words_per_frame
-    n_words = data_bytes // 2
-    n_cycles = n_words // words_per_cycle
+    bytes_per_cycle = words_per_cycle * 2
+    n_cycles = data_bytes // bytes_per_cycle
     if n_cycles < 1:
         return {}
 
     if progress_cb:
-        progress_cb(0, "Leyendo archivo… 0 MB")
+        progress_cb(0, "Iniciando lectura…")
 
-    raw = np.empty(n_cycles * words_per_cycle, dtype="<i2")
-    f.seek(data_offset)
-    byte_total = n_cycles * words_per_cycle * 2
-    got = 0
-    view = raw.view(np.uint8)
-    chunk = 8 * 1024 * 1024
-    last_pct = -1
-    while got < byte_total:
-        n = f.readinto(view[got:got + chunk])
-        if not n:
-            break
-        got += n
-        if progress_cb:
-            pct = min(70, int(70 * got / byte_total))
-            if pct != last_pct:
-                mb = got / (1024 * 1024)
-                tot = byte_total / (1024 * 1024)
-                progress_cb(pct, f"Leyendo archivo… {mb:.0f} / {tot:.0f} MB")
-                last_pct = pct
-
-    if progress_cb:
-        progress_cb(75, "Armando canales…")
-
-    frames = raw.reshape(n_cycles, frames_per_cycle, words_per_frame)
-    cols = {}
-    if n_fast:
-        fast = frames[:, :, :n_fast].mean(axis=1)
-        for i in range(n_fast):
-            cols[f"ANA_{i+1}"] = fast[:, i]
-
-    if cev_format == 1:
-        _assign_subcomm(frames, 16, FMT1_WORD17, cols)
-    elif cev_format == 2:
-        _assign_subcomm(frames, 9, FMT2_WORD10, cols)
-        _assign_subcomm(frames, 10, FMT2_WORD11, cols)
-    else:
-        for slot in range(words_per_frame):
-            names = [row[slot] if slot < len(row) else "LIBRE" for row in FMT3_TABLE]
-            _assign_subcomm(frames, slot, names, cols)
-
-    for key, scale in IMU_SCALES.items():
-        if key in cols:
-            cols[key] = cols[key] / scale
-
+    # Pre-reservar arrays por columna (ocupan ~175 MB para 3 hs de vuelo en lugar de 1 GB contiguo)
     arrays = {k: np.full(n_cycles, np.nan, dtype=np.float32) for k in CSV_COLUMNS}
     arrays["ciclo"] = np.arange(1, n_cycles + 1, dtype=np.float32)
     arrays["tiempo_s"] = np.arange(n_cycles, dtype=np.float32) / cycles_per_sec
 
-    for key, col in cols.items():
-        if key in ("LAT_H", "LAT_L", "LON_H", "LON_L"):
-            continue
-        if key == "ALT":
-            arrays["ALT"] = (col.astype(np.float32) * np.float32(0.3048))
-            continue
-        if key == "DIG":
-            dig = col.astype(np.int32)
-            for bit in range(16):
-                arrays[f"DIG_{bit+1}"] = ((dig >> bit) & 1).astype(np.float32)
-            continue
-        if key in arrays:
-            arrays[key] = col.astype(np.float32)
+    f.seek(data_offset)
+    CHUNK_CYCLES = 25000  # Bloques de ~34 MB para procesamiento eficiente sin sobrecargar memoria
+    last_pct = -1
 
-    if "LAT_H" in cols and "LAT_L" in cols:
-        arrays["LAT"] = _latlon_col(cols["LAT_H"], cols["LAT_L"])
-    if "LON_H" in cols and "LON_L" in cols:
-        arrays["LON"] = _latlon_col(cols["LON_H"], cols["LON_L"])
+    for c_start in range(0, n_cycles, CHUNK_CYCLES):
+        c_count = min(CHUNK_CYCLES, n_cycles - c_start)
+        c_end = c_start + c_count
+
+        raw_bytes = f.read(c_count * bytes_per_cycle)
+        if len(raw_bytes) < c_count * bytes_per_cycle:
+            actual_cycles = len(raw_bytes) // bytes_per_cycle
+            if actual_cycles == 0:
+                if c_start < n_cycles:
+                    for k in arrays:
+                        arrays[k] = arrays[k][:c_start]
+                break
+            c_count = actual_cycles
+            c_end = c_start + c_count
+            raw_bytes = raw_bytes[:actual_cycles * bytes_per_cycle]
+
+        raw_chunk = np.frombuffer(raw_bytes, dtype="<i2")
+        frames = raw_chunk.reshape(c_count, frames_per_cycle, words_per_frame)
+
+        # 1. Canales rápidos
+        if n_fast:
+            fast = frames[:, :, :n_fast].mean(axis=1, dtype=np.float32)
+            for i in range(n_fast):
+                arrays[f"ANA_{i+1}"][c_start:c_end] = fast[:, i]
+
+        # 2. Sub-conmutación
+        chunk_cols = {}
+        if cev_format == 1:
+            _assign_subcomm(frames, 16, FMT1_WORD17, chunk_cols)
+        elif cev_format == 2:
+            _assign_subcomm(frames, 9, FMT2_WORD10, chunk_cols)
+            _assign_subcomm(frames, 10, FMT2_WORD11, chunk_cols)
+        else:
+            for slot in range(words_per_frame):
+                names = [row[slot] if slot < len(row) else "LIBRE" for row in FMT3_TABLE]
+                _assign_subcomm(frames, slot, names, chunk_cols)
+
+        # 3. Escalar IMU
+        for key, scale in IMU_SCALES.items():
+            if key in chunk_cols:
+                chunk_cols[key] = chunk_cols[key].astype(np.float32) / scale
+
+        # 4. Asignar a arrays principales
+        for key, col in chunk_cols.items():
+            if key in ("LAT_H", "LAT_L", "LON_H", "LON_L"):
+                continue
+            if key == "ALT":
+                arrays["ALT"][c_start:c_end] = col.astype(np.float32) * np.float32(0.3048)
+                continue
+            if key == "DIG":
+                dig = col.astype(np.int32)
+                for bit in range(16):
+                    arrays[f"DIG_{bit+1}"][c_start:c_end] = ((dig >> bit) & 1).astype(np.float32)
+                continue
+            if key in arrays:
+                arrays[key][c_start:c_end] = col.astype(np.float32)
+
+        # 5. GPS LAT / LON
+        if "LAT_H" in chunk_cols and "LAT_L" in chunk_cols:
+            arrays["LAT"][c_start:c_end] = _latlon_col(chunk_cols["LAT_H"], chunk_cols["LAT_L"])
+        if "LON_H" in chunk_cols and "LON_L" in chunk_cols:
+            arrays["LON"][c_start:c_end] = _latlon_col(chunk_cols["LON_H"], chunk_cols["LON_L"])
+
+        if progress_cb:
+            pct = min(99, int(100 * c_end / n_cycles))
+            if pct != last_pct:
+                mb_proc = (c_end * bytes_per_cycle) / (1024 * 1024)
+                mb_tot = (n_cycles * bytes_per_cycle) / (1024 * 1024)
+                progress_cb(pct, f"Procesando archivo… {mb_proc:.0f} / {mb_tot:.0f} MB ({pct}%)")
+                last_pct = pct
 
     if progress_cb:
         progress_cb(100, f"Listo — {n_cycles:,} ciclos")
@@ -492,10 +524,25 @@ def welch_psd(x: np.ndarray, fs: float,
     return freqs, psd
 
 
+def magnitude_spectrum(x: np.ndarray, fs: float, max_n: int = 32768):
+    """FFT unilateral |Y(f)|, sin DC. Devuelve (freqs_hz, magnitud)."""
+    y = np.asarray(x, dtype=np.float64)
+    y = y[~np.isnan(y)]
+    if len(y) < 8:
+        return np.array([]), np.array([])
+    if len(y) > max_n:
+        y = y[-max_n:]
+    y = y - y.mean()
+    n = len(y)
+    mag = np.abs(np.fft.rfft(y)) * 2.0 / n
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    return freqs[1:], mag[1:]
+
+
 # ==============================================================================
 # Límite de puntos para gráficos (decimación automática)
 # ==============================================================================
-MAX_PLOT_POINTS = 6000   # puntos máximos por canal en los gráficos
+MAX_PLOT_POINTS = 25000   # puntos máximos por canal en los gráficos generales
 
 
 def _build_arrays(records: list) -> dict:
@@ -581,8 +628,11 @@ class FDRConverterApp(tk.Tk):
         self._found_files : list[dict] = []
         self._ch_var      = tk.StringVar()   # canal seleccionado en Vista Individual
         self._cal_mode    = tk.BooleanVar(value=False)   # True = mostrar valores calibrados
+        self._freq_mode   = tk.BooleanVar(value=False)   # True = dominio de la frecuencia
+        self._time_unit   = tk.StringVar(value="Segundos (s)")
         # cal_data: {canal: {"name", "unit", "mode": "linear"|"poly", "coeffs": [...]}}
         self._cal_data: dict = {}
+        self._grid_cfg: dict = {}
 
         self._build_ui()
 
@@ -767,6 +817,23 @@ class FDRConverterApp(tk.Tk):
                        bg=BG_CARD, fg=FG_TEXT, selectcolor=BG_PANEL,
                        activebackground=BG_CARD, activeforeground=ACCENT,
                        font=("Segoe UI", 9)).pack(side="left")
+        freq_row = tk.Frame(card, bg=BG_CARD)
+        freq_row.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Checkbutton(freq_row, text="Dominio de la frecuencia (FFT)",
+                       variable=self._freq_mode,
+                       command=self._on_cal_toggle,
+                       bg=BG_CARD, fg=FG_TEXT, selectcolor=BG_PANEL,
+                       activebackground=BG_CARD, activeforeground=ACCENT,
+                       font=("Segoe UI", 9)).pack(side="left")
+        time_row = tk.Frame(card, bg=BG_CARD)
+        time_row.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Label(time_row, text="Tiempo:", bg=BG_CARD, fg=FG_TEXT,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
+        self._time_unit_combo = ttk.Combobox(time_row, textvariable=self._time_unit,
+                                             values=["Segundos (s)", "Minutos (min)", "Horas (h)"],
+                                             state="readonly", font=("Segoe UI", 9), width=13)
+        self._time_unit_combo.pack(side="left")
+        self._time_unit_combo.bind("<<ComboboxSelected>>", self._on_time_unit_change)
 
     # ── Sección: info del archivo ──────────────────────────────────────
     def _build_info_panel(self, parent):
@@ -987,7 +1054,7 @@ class FDRConverterApp(tk.Tk):
             f"Ciclos:    {len(records):,}\n"
             f"Duración:  {dur_s:.1f} s  ({dur_s/60:.1f} min)\n"
             f"Archivo:   {size_mb:.1f} MB\n"
-            + (f"Gráfico:   cada {step} ciclos (decimado)" if step > 1 else "")
+            + (f"Gráfico general: cada {step} ciclos\n(Vista Individual: 100% datos reales)" if step > 1 else "")
         )
         self._info_label.config(text=info, fg=GREEN)
 
@@ -1014,8 +1081,14 @@ class FDRConverterApp(tk.Tk):
             self._draw_gps_tab(records)
             cps = {1: 75, 2: 75, 3: 10}[fmt]
             dur_s = len(records) / cps
+            if dur_s >= 3600:
+                dur_str = f"{dur_s/3600:.2f} h ({dur_s:.0f} s)"
+            elif dur_s >= 60:
+                dur_str = f"{dur_s/60:.1f} min ({dur_s:.0f} s)"
+            else:
+                dur_str = f"{dur_s:.0f} s"
             self._set_status(
-                f"OK — {len(records):,} ciclos  ({dur_s:.0f} s de vuelo)", 100
+                f"OK — {len(records):,} ciclos  ({dur_str} de vuelo)", 100
             )
         except Exception as exc:
             self._on_error(exc)
@@ -1040,25 +1113,88 @@ class FDRConverterApp(tk.Tk):
             return base_label
         c = self._cal_data.get(key, {})
         name = c.get("name", "").strip()
-        unit = c.get("unit", "").strip()
+        unit = self._channel_unit(key)
         if name:
             return f"{name}  [{unit}]" if unit else name
         return f"{base_label}  [{unit}]" if unit else base_label
 
+    def _channel_unit(self, key: str) -> str:
+        """Unidad del canal: calibración, grilla, IMU o LSB."""
+        if self._cal_mode.get():
+            u = (self._cal_data.get(key, {}).get("unit", "") or
+                 self._grid_cfg.get(key, {}).get("unit", "")).strip()
+            if u:
+                return u
+        if key in IMU_UNITS:
+            return IMU_UNITS[key]
+        if key.startswith("DIG"):
+            return "0/1"
+        if key in ("LAT", "LON"):
+            return "°"
+        if key == "ALT":
+            return "m"
+        if key in TIME_COLS:
+            return TIME_LABELS.get(key, "")
+        return "LSB"
+
     def _cal_ylabel(self, base: str, keys: list) -> str:
-        """Unidad del eje Y: si todos los canales del grupo tienen la misma unidad, la muestra."""
+        """Unidad del eje Y. Con calibración activa usa la unidad elegida."""
         if not self._cal_mode.get():
             return base
-        units = {self._cal_data.get(k, {}).get("unit", "") for k in keys}
-        units.discard("")
-        return next(iter(units)) if len(units) == 1 else base
+        units = []
+        for k in keys:
+            u = (self._cal_data.get(k, {}).get("unit", "") or
+                 self._grid_cfg.get(k, {}).get("unit", "")).strip()
+            if u:
+                units.append(u)
+        uniq = list(dict.fromkeys(units))
+        if len(uniq) == 1:
+            return uniq[0]
+        if uniq:
+            return " / ".join(uniq)
+        return base
+
+    def _series_fs(self) -> float:
+        return 10.0 if self._cev_format == 3 else 75.0
+
+    def _get_time_scale_and_label(self):
+        """Devuelve (factor_escala, etiqueta_eje, unidad_corta) según la unidad de tiempo elegida."""
+        unit = self._time_unit.get() if hasattr(self, "_time_unit") else "Segundos (s)"
+        if "Minuto" in unit or unit == "min":
+            return 1.0 / 60.0, "Tiempo (min)", "min"
+        elif "Hora" in unit or unit == "h":
+            return 1.0 / 3600.0, "Tiempo (h)", "h"
+        else:
+            return 1.0, "Tiempo (s)", "s"
+
+    def _on_time_unit_change(self, _event=None):
+        if self._records:
+            self._replot_all()
+
+    def _replot_all(self):
+        if not self._records:
+            return
+        fmt = self._cev_format
+        self._draw_plots(self._records, fmt)
+        self._draw_gps_tab(self._records)
+        if hasattr(self, "_indv_combo") and self._indv_combo.winfo_exists():
+            label = self._indv_combo.get()
+            if label:
+                self._draw_individual(label, self._records)
+        if hasattr(self, "_fig_psd") and self._fig_psd is not None:
+            self._calculate_psd()
+
+    def _trace_xy(self, val, t):
+        if self._freq_mode.get():
+            return magnitude_spectrum(val, self._series_fs())
+        return t, val
 
     def _on_cal_toggle(self):
         if self._records:
             self._replot_with_cal()
 
     def _replot_with_cal(self):
-        self._draw_plots(self._records, self._cev_format)
+        self._replot_all()
         self._setup_individual_tab(self._records, self._cev_format)
 
     # ──────────────────────────────────────────────────────────────────
@@ -1202,10 +1338,11 @@ class FDRConverterApp(tk.Tk):
             w.destroy()
 
         arrs = self._arrays
-        # Vista individual usa más puntos que la vista general (mejor resolución)
-        step = max(1, len(records) // (MAX_PLOT_POINTS * 2))
-        t   = _decimate(arrs["tiempo_s"], step)
-        val = self._apply_cal(_decimate(arrs.get(key, np.array([])), step), key)
+        # Vista individual: Datos reales sin decimar (resolución nativa a 75 Hz para zoom analítico)
+        scale, time_label, _ = self._get_time_scale_and_label()
+        t   = arrs["tiempo_s"] * scale
+        raw_val = arrs.get(key, np.array([]))
+        val = self._apply_cal(raw_val, key)
 
         # Calcular stats
         valid = val[~np.isnan(val)]
@@ -1228,40 +1365,50 @@ class FDRConverterApp(tk.Tk):
         else:
             color = YELLOW
 
-        # Unidad del eje Y
-        cal_unit = self._cal_data.get(key, {}).get("unit", "") if self._cal_mode.get() else ""
-        if cal_unit:
-            ylabel = cal_unit
-        elif key.startswith("ANA"):
-            ylabel = "LSB"
-        elif key in IMU_UNITS:
-            ylabel = IMU_UNITS[key]
-        elif key.startswith("DIG"):
+        ylabel = self._channel_unit(key)
+        if key.startswith("DIG") and not self._cal_mode.get():
             ylabel = "Estado (0/1)"
-        else:
-            ylabel = ""
 
         # Crear figura grande
         fig = Figure(figsize=(10, 5), facecolor=BG_DARK, tight_layout=True)
         ax  = fig.add_subplot(1, 1, 1, facecolor=BG_PANEL)
 
-        if key.startswith("DIG"):
+        freq_mode = self._freq_mode.get() and not key.startswith("DIG")
+        if freq_mode:
+            fx, fy = magnitude_spectrum(val, self._series_fs())
+            if len(fx):
+                ax.plot(fx, fy, color=color, lw=1.2)
+                ax.fill_between(fx, fy, alpha=0.08, color=color)
+                peak_i = int(np.argmax(fy))
+                ax.annotate(f"{fx[peak_i]:.2f} Hz",
+                            xy=(fx[peak_i], fy[peak_i]),
+                            xytext=(8, 8), textcoords="offset points",
+                            color=FG_MUTED, fontsize=8)
+            xlabel = "Frecuencia (Hz)"
+            ylabel = f"|Y(f)|  [{ylabel}]" if ylabel else "|Y(f)|"
+        elif key.startswith("DIG"):
             ax.fill_between(t, val, step="post", color=color, alpha=0.75)
             ax.plot(t, val, drawstyle="steps-post", color=color, lw=1.2)
             ax.set_ylim(-0.1, 1.3)
             ax.set_yticks([0, 1])
             ax.set_yticklabels(["0  (LOW)", "1  (HIGH)"], color=FG_MUTED, fontsize=9)
+            xlabel = time_label
+        elif key in ("SEG", "MIN", "HOR"):
+            ax.plot(t, val, drawstyle="steps-post", color=color, lw=1.2)
+            ax.fill_between(t, val, step="post", alpha=0.08, color=color)
+            xlabel = time_label
         else:
             ax.plot(t, val, color=color, lw=1.2)
             ax.fill_between(t, val, alpha=0.08, color=color)
+            xlabel = time_label
 
         ax.set_title(label, color=FG_TEXT, fontsize=12, pad=10)
-        ax.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=10)
+        ax.set_xlabel(xlabel, color=FG_MUTED, fontsize=10)
         ax.set_ylabel(ylabel, color=FG_MUTED, fontsize=10)
         _style_axes(ax)
 
-        # Anotaciones de mín/máx
-        if len(valid) and not key.startswith("DIG"):
+        # Anotaciones de mín/máx (solo dominio del tiempo)
+        if (not freq_mode) and len(valid) and not key.startswith("DIG"):
             idx_max = int(np.nanargmax(val))
             idx_min = int(np.nanargmin(val))
             for idx, txt, va in [(idx_max, f"máx {valid.max():.4g}", "bottom"),
@@ -1349,7 +1496,7 @@ class FDRConverterApp(tk.Tk):
         self._mon_tree.pack(side="left", fill="both", expand=True)
         msb.pack(side="right", fill="y")
 
-        # Poblar filas: ANA 1-32 (ch 0-31) y DIG 1-16 (ch 32-47)
+        # Poblar filas: ANA, DIG, IMU, tiempo GNSS y GPS
         self._mon_rows = []   # [(iid, channel_idx, param_key), ...]
         for i in range(32):
             key = f"ANA_{i+1}"
@@ -1359,6 +1506,26 @@ class FDRConverterApp(tk.Tk):
             key = f"DIG_{i+1}"
             iid = self._mon_tree.insert("", "end", values=(key, "", "—", "—", "0/1"))
             self._mon_rows.append((iid, 32 + i, key))
+        for i in range(13):
+            key = f"DSP_{i+1}"
+            name = IMU_LABELS.get(key, key)
+            unit = IMU_UNITS.get(key, "")
+            iid = self._mon_tree.insert("", "end",
+                                        values=(key, name, "—", "—", unit))
+            self._mon_rows.append((iid, CMD_CH_DSP_1 + i, key))
+        for i, key in enumerate(TIME_COLS):
+            name = TIME_LABELS.get(key, key)
+            iid = self._mon_tree.insert("", "end",
+                                        values=(key, name, "—", "—", ""))
+            self._mon_rows.append((iid, CMD_CH_DIA + i, key))
+        for key, name, unit, ch in (
+            ("LAT", "Latitud GPS", "°", CMD_CH_LAT_H),
+            ("LON", "Longitud GPS", "°", CMD_CH_LON_H),
+            ("ALT", "Altitud GPS", "m", CMD_CH_ALT),
+        ):
+            iid = self._mon_tree.insert("", "end",
+                                        values=(key, name, "—", "—", unit))
+            self._mon_rows.append((iid, ch, key))
 
         # Doble clic en una fila → editar sensor/nombre/unidad del canal
         self._mon_tree.bind("<Double-1>", self._mon_edit_row)
@@ -1384,11 +1551,25 @@ class FDRConverterApp(tk.Tk):
         for iid, _ch, key in self._mon_rows:
             c    = self._grid_cfg.get(key, {})
             vals = list(self._mon_tree.item(iid, "values"))
-            vals[1] = c.get("name", "")
+            vals[1] = (c.get("name", "") or IMU_LABELS.get(key, "") or
+                       TIME_LABELS.get(key, "") or
+                       {"LAT": "Latitud GPS", "LON": "Longitud GPS",
+                        "ALT": "Altitud GPS"}.get(key, vals[1] if len(vals) > 1 else ""))
             unit = (c.get("unit", "") or
                     self._cal_data.get(key, {}).get("unit", ""))
             if not unit:
-                unit = "0/1" if key.startswith("DIG") else "LSB"
+                if key.startswith("DIG"):
+                    unit = "0/1"
+                elif key in IMU_UNITS:
+                    unit = IMU_UNITS[key]
+                elif key in ("LAT", "LON"):
+                    unit = "°"
+                elif key == "ALT":
+                    unit = "m"
+                elif key in TIME_COLS:
+                    unit = ""
+                else:
+                    unit = "LSB"
             vals[4] = unit
             self._mon_tree.item(iid, values=vals)
 
@@ -1507,7 +1688,8 @@ class FDRConverterApp(tk.Tk):
                 time.sleep(0.02)
                 continue
             try:
-                for _, ch, _ in self._mon_rows:
+                query_chs = list(range(CMD_CH_COUNT))
+                for ch in query_chs:
                     if not self._mon_running:
                         return
                     try:
@@ -1546,24 +1728,49 @@ class FDRConverterApp(tk.Tk):
             grid_c = self._grid_cfg.get(key, {})
             cal_c  = self._cal_data.get(key, {})
 
-            # Nombre: grilla → calibración
-            name = grid_c.get("name", "") or cal_c.get("name", "")
+            # Nombre: grilla → calibración → etiqueta conocida
+            name = (grid_c.get("name", "") or cal_c.get("name", "") or
+                    IMU_LABELS.get(key, "") or TIME_LABELS.get(key, "") or
+                    {"LAT": "Latitud GPS", "LON": "Longitud GPS",
+                     "ALT": "Altitud GPS"}.get(key, ""))
 
             # Unidad: grilla → calibración → por defecto
             unit_str = (grid_c.get("unit", "") or cal_c.get("unit", "") or
-                        ("0/1" if key.startswith("DIG") else "LSB"))
+                        IMU_UNITS.get(key, "") or
+                        ("0/1" if key.startswith("DIG") else
+                         ("°" if key in ("LAT", "LON") else
+                          ("m" if key == "ALT" else
+                           ("" if key in TIME_COLS else "LSB")))))
 
-            # Valor calibrado si hay coeficientes
-            if cal_c.get("coeffs"):
-                cal_val = float(np.polyval(cal_c["coeffs"], raw))
-                cal_str = f"{cal_val:.4g}"
-            else:
-                cal_str = "—"
-
-            if key.startswith("DIG"):
+            if key == "LAT":
+                val = _reconstruct_latlon(values.get(CMD_CH_LAT_H),
+                                          values.get(CMD_CH_LAT_L))
+                raw_str = f"{val:.6f}" if val is not None else "—"
+                cal_str = raw_str
+                unit_str = unit_str or "°"
+            elif key == "LON":
+                val = _reconstruct_latlon(values.get(CMD_CH_LON_H),
+                                          values.get(CMD_CH_LON_L))
+                raw_str = f"{val:.6f}" if val is not None else "—"
+                cal_str = raw_str
+                unit_str = unit_str or "°"
+            elif key == "ALT":
+                raw_str = str(raw)
+                cal_str = f"{raw * 0.3048:.1f}"
+                unit_str = unit_str or "m"
+            elif key.startswith("DIG"):
                 raw_str = "1  (HIGH)" if raw else "0  (LOW)"
+                cal_str = "—"
+            elif cal_c.get("coeffs"):
+                raw_str = str(raw)
+                cal_str = f"{float(np.polyval(cal_c['coeffs'], raw)):.4g}"
+            elif key in IMU_SCALES:
+                raw_str = str(raw)
+                cal_str = f"{raw / IMU_SCALES[key]:.4g}"
+                unit_str = unit_str or IMU_UNITS.get(key, "")
             else:
                 raw_str = str(raw)
+                cal_str = "—"
 
             self._mon_tree.item(iid, values=(key, name, raw_str, cal_str, unit_str))
 
@@ -1800,6 +2007,7 @@ class FDRConverterApp(tk.Tk):
             str(self._tab_imu):  getattr(self, "_fig_imu",  None),
             str(self._tab_dig):  getattr(self, "_fig_dig",  None),
             str(self._tab_time): getattr(self, "_fig_time", None),
+            str(self._tab_gps):  getattr(self, "_fig_gps",  None),
             str(self._tab_indv): getattr(self, "_fig_indv", None),
             str(self._tab_psd):  getattr(self, "_fig_psd",  None),
         }
@@ -1855,7 +2063,8 @@ class FDRConverterApp(tk.Tk):
             bin_path   = self._bin_path.get()
             cal_active = self._cal_mode.get() and bool(self._cal_data)
             step       = max(1, n_cycles // MAX_PLOT_POINTS)
-            t          = _decimate(arrs["tiempo_s"], step)
+            scale, time_label, _ = self._get_time_scale_and_label()
+            t          = _decimate(arrs["tiempo_s"], step) * scale
             now_str    = datetime.datetime.now().strftime("%d/%m/%Y  %H:%M")
             A4         = (8.27, 11.69)
 
@@ -2103,7 +2312,7 @@ class FDRConverterApp(tk.Tk):
                         ax.plot(t, v, lw=0.7, label=ln,
                                 color=palette_ana[ci % len(palette_ana)])
                     ylabel = "Unidad calibrada" if cal_active else "LSB"
-                    ax.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=9)
+                    ax.set_xlabel(time_label, color=FG_MUTED, fontsize=9)
                     ax.set_ylabel(ylabel, color=FG_MUTED, fontsize=9)
                     _style_axes(ax)
                     ax.legend(loc="upper right", fontsize=6, ncol=4,
@@ -2136,7 +2345,7 @@ class FDRConverterApp(tk.Tk):
                         ax.plot(t, v, lw=0.9,
                                 label=IMU_LABELS.get(key, key),
                                 color=pal_imu[ci % len(pal_imu)])
-                    ax.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=9)
+                    ax.set_xlabel(time_label, color=FG_MUTED, fontsize=9)
                     ax.set_ylabel(unit_pg, color=FG_MUTED, fontsize=9)
                     _style_axes(ax)
                     ax.legend(loc="upper right", fontsize=8,
@@ -2175,7 +2384,7 @@ class FDRConverterApp(tk.Tk):
                     if len(v):
                         ax.plot(t, v, lw=0.9, color=YELLOW)
                     ax.set_title(ttl_g, color=FG_TEXT, fontsize=9)
-                    ax.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=8)
+                    ax.set_xlabel(time_label, color=FG_MUTED, fontsize=8)
                     _style_axes(ax)
                 _save(fig, pdf)
 
@@ -2198,7 +2407,7 @@ class FDRConverterApp(tk.Tk):
                         ax = fig.add_subplot(3, 1, idx_g, facecolor=BG_PANEL)
                         ax.plot(t, arr_g, lw=0.9, color=col_g)
                         ax.set_title(ttl_g, color=FG_TEXT, fontsize=9)
-                        ax.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=8)
+                        ax.set_xlabel(time_label, color=FG_MUTED, fontsize=8)
                         ax.set_ylabel(ylbl_g, color=FG_MUTED, fontsize=8)
                         _style_axes(ax)
                     _save(fig, pdf)
@@ -2224,11 +2433,11 @@ class FDRConverterApp(tk.Tk):
                     fig.subplots_adjust(top=0.88, bottom=0.06, left=0.1, right=0.96)
 
                     ax1 = fig.add_subplot(2, 1, 1, facecolor=BG_PANEL)
-                    t_full = _decimate(arrs["tiempo_s"], step)
+                    t_full = _decimate(arrs["tiempo_s"], step) * scale
                     v_plot = _decimate(raw, step)
                     ax1.plot(t_full, v_plot, lw=0.8, color=ACCENT)
                     ax1.set_title("Señal temporal", color=FG_TEXT, fontsize=9)
-                    ax1.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=8)
+                    ax1.set_xlabel(time_label, color=FG_MUTED, fontsize=8)
                     ax1.set_ylabel("m/s²", color=FG_MUTED, fontsize=8)
                     _style_axes(ax1)
 
@@ -2250,7 +2459,7 @@ class FDRConverterApp(tk.Tk):
                 # 15+.  VISTA INDIVIDUAL POR CANAL
                 # ════════════════════════════════════════════════════
                 indv_step = max(1, n_cycles // (MAX_PLOT_POINTS * 2))
-                t_indv    = _decimate(arrs["tiempo_s"], indv_step)
+                t_indv    = _decimate(arrs["tiempo_s"], indv_step) * scale
 
                 # Canales ANA y DSP con datos reales
                 indv_keys = [(k, k) for k in ANA_COLS + DSP_COLS
@@ -2305,7 +2514,7 @@ class FDRConverterApp(tk.Tk):
                                         arrowprops=dict(arrowstyle="-",
                                                         color=FG_MUTED, lw=0.7))
 
-                    ax.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=9)
+                    ax.set_xlabel(time_label, color=FG_MUTED, fontsize=9)
                     ax.set_ylabel(unit, color=FG_MUTED, fontsize=9)
                     _style_axes(ax)
 
@@ -3050,8 +3259,12 @@ class FDRConverterApp(tk.Tk):
 
         ax.scatter(xs, ys, color=ACCENT, s=40, zorder=5, label="Puntos medidos")
         ax.plot(x_curve, y_curve, color=GREEN, lw=1.5, label=f"Ajuste  R²={r2:.4f}")
+        key = self._lsq_chan.get()
+        unit = (self._cal_data.get(key, {}).get("unit", "") or
+                self._grid_cfg.get(key, {}).get("unit", "") or
+                "Valor real")
         ax.set_xlabel("Valor LSB", color=FG_MUTED, fontsize=8)
-        ax.set_ylabel("Valor real", color=FG_MUTED, fontsize=8)
+        ax.set_ylabel(unit, color=FG_MUTED, fontsize=8)
         ax.set_title(f"Ajuste por mínimos cuadrados  —  {self._lsq_chan.get()}",
                      color=FG_TEXT, fontsize=9)
         _style_axes(ax)
@@ -3067,7 +3280,8 @@ class FDRConverterApp(tk.Tk):
         key  = self._lsq_chan.get()
         deg  = self._lsq_deg.get()
         name = self._grid_cfg.get(key, {}).get("name", "")
-        unit = self._cal_data.get(key, {}).get("unit", "")
+        unit = (self._cal_data.get(key, {}).get("unit", "") or
+                self._grid_cfg.get(key, {}).get("unit", ""))
 
         self._cal_data[key] = {
             "name":   name,
@@ -3543,11 +3757,13 @@ class FDRConverterApp(tk.Tk):
                       facecolor=BG_DARK, tight_layout=True)
 
         # ── Subplot 1: señal en el tiempo ──
+        scale, time_label, unit_suffix = self._get_time_scale_and_label()
+        t_scaled = t_seg * scale
         ax_t = fig.add_subplot(rows, 1, 1, facecolor=BG_PANEL)
-        ax_t.plot(t_seg, val, lw=0.8, color=ACCENT)
-        ax_t.set_title(f"Señal temporal  —  {title}  [{t0:.1f} s – {t1:.1f} s]",
+        ax_t.plot(t_scaled, val, lw=0.8, color=ACCENT)
+        ax_t.set_title(f"Señal temporal  —  {title}  [{t0*scale:.2f} {unit_suffix} – {t1*scale:.2f} {unit_suffix}]",
                        color=FG_TEXT, fontsize=10)
-        ax_t.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=8)
+        ax_t.set_xlabel(time_label, color=FG_MUTED, fontsize=8)
         ax_t.set_ylabel(y_label.split("[")[1].rstrip("]") if "[" in y_label else "",
                         color=FG_MUTED, fontsize=8)
         _style_axes(ax_t)
@@ -3594,7 +3810,8 @@ class FDRConverterApp(tk.Tk):
         self._clear_tab(self._tab_gps)
         arrs = self._arrays
         step = max(1, len(records) // MAX_PLOT_POINTS)
-        t    = _decimate(arrs["tiempo_s"], step)
+        scale, time_label, _ = self._get_time_scale_and_label()
+        t    = _decimate(arrs["tiempo_s"], step) * scale
 
         lat = _decimate(arrs.get("LAT", np.array([])), step)
         lon = _decimate(arrs.get("LON", np.array([])), step)
@@ -3604,6 +3821,7 @@ class FDRConverterApp(tk.Tk):
                    len(lon) > 0 and not np.all(np.isnan(lon)))
 
         if not has_gps:
+            self._fig_gps = None
             self._placeholder(self._tab_gps,
                               "Sin datos de posición GPS\n"
                               "(solo disponible en Formato 2 y Formato 3)")
@@ -3630,7 +3848,7 @@ class FDRConverterApp(tk.Tk):
         ax3.plot(t, alt, lw=0.9, color=ORANGE)
         ax3.fill_between(t, alt, alpha=0.1, color=ORANGE)
         ax3.set_title("Altitud", color=FG_TEXT, fontsize=10)
-        ax3.set_xlabel("Tiempo (s)", color=FG_MUTED, fontsize=8)
+        ax3.set_xlabel(time_label, color=FG_MUTED, fontsize=8)
         ax3.set_ylabel("m", color=FG_MUTED, fontsize=8)
         _style_axes(ax3)
 
@@ -3641,9 +3859,14 @@ class FDRConverterApp(tk.Tk):
         arrs   = self._arrays
         n      = len(records)
         step   = max(1, n // MAX_PLOT_POINTS)
-        t      = _decimate(arrs["tiempo_s"], step)
-        xlabel = "Tiempo (s)"
-        dec_note = f"  (decimado ×{step})" if step > 1 else ""
+        scale, time_label, _ = self._get_time_scale_and_label()
+        t      = _decimate(arrs["tiempo_s"], step) * scale
+        freq_mode = self._freq_mode.get()
+        xlabel = "Frecuencia (Hz)" if freq_mode else time_label
+        dec_note = "" if freq_mode else (f"  (decimado ×{step})" if step > 1 else "")
+        ana_ylabel = self._cal_ylabel("LSB", [f"ANA_{i}" for i in range(1, 17)])
+        if freq_mode:
+            ana_ylabel = f"|Y(f)|  [{ana_ylabel}]"
 
         # ── Analógicas ────────────────────────────────────────────────
         self._clear_tab(self._tab_ana)
@@ -3660,13 +3883,17 @@ class FDRConverterApp(tk.Tk):
         ax1 = fig_ana.add_subplot(2, 1, 1, facecolor=BG_PANEL)
         for i in range(1, n_fast + 1):
             key = f"ANA_{i}"
-            v = self._apply_cal(_decimate(arrs.get(key, np.array([])), step), key)
-            if len(v) and not np.all(np.isnan(v)):
-                ln, = ax1.plot(t, v, lw=0.8, label=self._cal_label(key, f"ANA {i}"))
+            raw = arrs.get(key, np.array([]))
+            v = self._apply_cal(raw if freq_mode else _decimate(raw, step), key)
+            x, y = self._trace_xy(v, t)
+            if len(y) and not np.all(np.isnan(y)):
+                ln, = ax1.plot(x, y, lw=0.8, label=self._cal_label(key, f"ANA {i}"))
                 lines_ax1.append(ln)
-        ax1.set_title(f"Canales Rápidos{dec_note}  —  clic en leyenda = mostrar/ocultar",
-                      color=FG_TEXT, fontsize=10)
-        ax1.set_ylabel(self._cal_ylabel("LSB", fast_keys), color=FG_MUTED, fontsize=8)
+        ax1.set_title(
+            f"{'Espectro — ' if freq_mode else ''}Canales Rápidos{dec_note}  —  clic en leyenda = mostrar/ocultar",
+            color=FG_TEXT, fontsize=10)
+        ax1.set_ylabel(ana_ylabel if freq_mode else self._cal_ylabel("LSB", fast_keys),
+                       color=FG_MUTED, fontsize=8)
         _style_axes(ax1)
         leg1 = ax1.legend(loc="upper right", fontsize=7, ncol=4,
                           facecolor=BG_CARD, edgecolor="none", labelcolor=FG_TEXT)
@@ -3676,14 +3903,18 @@ class FDRConverterApp(tk.Tk):
         ax2 = fig_ana.add_subplot(2, 1, 2, facecolor=BG_PANEL)
         for i in range(n_fast + 1, 33):
             key = f"ANA_{i}"
-            v = self._apply_cal(_decimate(arrs.get(key, np.array([])), step), key)
-            if len(v) and not np.all(np.isnan(v)):
-                ln, = ax2.plot(t, v, lw=0.8, label=self._cal_label(key, f"ANA {i}"))
+            raw = arrs.get(key, np.array([]))
+            v = self._apply_cal(raw if freq_mode else _decimate(raw, step), key)
+            x, y = self._trace_xy(v, t)
+            if len(y) and not np.all(np.isnan(y)):
+                ln, = ax2.plot(x, y, lw=0.8, label=self._cal_label(key, f"ANA {i}"))
                 lines_ax2.append(ln)
-        ax2.set_title(f"Canales Lentos{dec_note}  —  clic en leyenda = mostrar/ocultar",
-                      color=FG_TEXT, fontsize=10)
+        ax2.set_title(
+            f"{'Espectro — ' if freq_mode else ''}Canales Lentos{dec_note}  —  clic en leyenda = mostrar/ocultar",
+            color=FG_TEXT, fontsize=10)
         ax2.set_xlabel(xlabel, color=FG_MUTED, fontsize=8)
-        ax2.set_ylabel(self._cal_ylabel("LSB", slow_keys), color=FG_MUTED, fontsize=8)
+        ax2.set_ylabel(ana_ylabel if freq_mode else self._cal_ylabel("LSB", slow_keys),
+                       color=FG_MUTED, fontsize=8)
         _style_axes(ax2)
         leg2 = ax2.legend(loc="upper right", fontsize=7, ncol=4,
                           facecolor=BG_CARD, edgecolor="none", labelcolor=FG_TEXT)
@@ -3709,12 +3940,15 @@ class FDRConverterApp(tk.Tk):
             ax     = fig_imu.add_subplot(2, 2, idx, facecolor=BG_PANEL)
             ax_lns = []
             for ci, key in enumerate(keys):
-                v = _decimate(arrs.get(key, np.array([])), step)
-                if len(v) and not np.all(np.isnan(v)):
-                    ln, = ax.plot(t, v, lw=0.9, label=IMU_LABELS.get(key, key),
+                raw = arrs.get(key, np.array([]))
+                v = raw if freq_mode else _decimate(raw, step)
+                x, y = self._trace_xy(v, t)
+                if len(y) and not np.all(np.isnan(y)):
+                    ln, = ax.plot(x, y, lw=0.9, label=IMU_LABELS.get(key, key),
                                   color=palette[ci % len(palette)])
                     ax_lns.append(ln)
-            ax.set_title(title, color=FG_TEXT, fontsize=9)
+            ax.set_title(("Espectro — " if freq_mode else "") + title,
+                         color=FG_TEXT, fontsize=9)
             ax.set_xlabel(xlabel, color=FG_MUTED, fontsize=7)
             _style_axes(ax)
             leg = ax.legend(loc="upper right", fontsize=7,
@@ -3745,17 +3979,18 @@ class FDRConverterApp(tk.Tk):
         # ── Tiempo GNSS ───────────────────────────────────────────────
         self._clear_tab(self._tab_time)
         fig_time = Figure(figsize=(9, 4), facecolor=BG_DARK, tight_layout=True)
+        t_full = arrs["tiempo_s"] * scale
         for idx, (key, title) in enumerate([("HOR","Hora"),("MIN","Minuto"),("SEG","Segundo")], 1):
             ax = fig_time.add_subplot(1, 3, idx, facecolor=BG_PANEL)
-            v  = _decimate(arrs.get(key, np.array([])), step)
-            ax.plot(t, v, lw=0.9, color=YELLOW)
+            v  = arrs.get(key, np.array([]))
+            ax.plot(t_full, v, lw=0.9, color=YELLOW, drawstyle="steps-post")
             ax.set_title(title, color=FG_TEXT, fontsize=9)
-            ax.set_xlabel(xlabel, color=FG_MUTED, fontsize=8)
+            ax.set_xlabel(time_label, color=FG_MUTED, fontsize=8)
             _style_axes(ax)
-        pps = _decimate(arrs.get("DSP_12", np.array([])), step)
+        pps = arrs.get("DSP_12", np.array([]))
         if len(pps) and not np.all(np.isnan(pps)):
             ax_s = fig_time.axes[2]
-            ax_s.fill_between(t, pps * 60, step="post", color=GREEN, alpha=0.3, label="PPS")
+            ax_s.fill_between(t_full, pps * 60, step="post", color=GREEN, alpha=0.3, label="PPS")
             ax_s.legend(fontsize=7, facecolor=BG_CARD, edgecolor="none", labelcolor=FG_TEXT)
         self._fig_time = fig_time
         self._embed_figure(fig_time, self._tab_time)

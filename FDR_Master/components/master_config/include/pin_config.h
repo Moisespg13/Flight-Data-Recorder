@@ -30,7 +30,8 @@
 // ============================================================================
 #define PIN_SD_MOSI 38
 #define PIN_SD_CLK  39
-#define PIN_SD_MISO 40
+#define PIN_SD_MISO  40  // MISO para SD1
+#define PIN_SD_MISO2 21  // MISO separado para SD2 (evita colisión MISO en protoboard)
 #define PIN_SD_CS1  1
 #define PIN_SD_CS2  2
 

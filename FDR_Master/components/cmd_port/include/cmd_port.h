@@ -10,7 +10,8 @@
  *   [Header 16b] [Comando 16b] [Dato 16b]
  *
  * Comandos soportados:
- *   CMD 1: Lectura en tiempo real de un parámetro analógico.
+ *   CMD 1: Lectura en tiempo real (ANA 0..31, DIG 32..47,
+ *          IMU 48..60, tiempo GNSS 61..66, posición 67..71).
  *   CMD 2: Escritura del formato de muestreo en memoria no volátil.
  *   CMD 3: Lectura del formato de muestreo almacenado.
  *   CMD 4: Formatear MicroSD (requiere clave de confirmación 0x55AA).
@@ -72,6 +73,8 @@ esp_err_t cmd_port_process(void);
  * actualizado el valor que se devuelve ante un CMD_READ_PARAM.
  *
  * @param channel Número de canal (0..31 analógicos, 32..47 discretas).
+ *                CMD 1 también lee 48..71 (IMU, tiempo GNSS, posición) desde
+ *                el ensamblador; esos no se actualizan por acá.
  * @param value   Valor actual del canal (raw 16 bits).
  */
 void cmd_port_update_channel(uint8_t channel, int16_t value);

@@ -21,6 +21,7 @@
 #include "cmd_port.h"
 #include "pin_config.h"
 #include "sd_storage.h"
+#include "sample_format.h"
 
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -46,8 +47,19 @@ static const char *TAG = "CMD_PORT";
 // Canales 0..15:  analógicos rápidos (ANA 1..16)
 // Canales 16..31: analógicos lentos (ANA 17..32)
 // Canales 32..47: discretas (bit a bit)
-#define MAX_CHANNELS 48
-static int16_t s_channel_values[MAX_CHANNELS] = {0};
+// Canales 48..71: IMU / tiempo GNSS / posición (leídos de sample_format)
+#define CMD_CH_ANA_DIG 48
+#define MAX_CHANNELS   72
+static int16_t s_channel_values[CMD_CH_ANA_DIG] = {0};
+
+static const cev_param_id_t s_cmd_ext[] = {
+    PARAM_DSP_1,  PARAM_DSP_2,  PARAM_DSP_3,  PARAM_DSP_4,
+    PARAM_DSP_5,  PARAM_DSP_6,  PARAM_DSP_7,  PARAM_DSP_8,
+    PARAM_DSP_9,  PARAM_DSP_10, PARAM_DSP_11, PARAM_DSP_12,
+    PARAM_DSP_13,
+    PARAM_DIA, PARAM_MES, PARAM_ANO, PARAM_HOR, PARAM_MIN, PARAM_SEG,
+    PARAM_LAT_H, PARAM_LAT_L, PARAM_LON_H, PARAM_LON_L, PARAM_ALT,
+};
 
 // Buffer de recepción para acumular bytes hasta tener un mensaje completo
 static uint8_t s_rx_buf[sizeof(cmd_message_t)];
@@ -74,7 +86,7 @@ static void send_response(uint16_t command, uint16_t data) {
 /**
  * @brief Ejecuta CMD 1: Lectura de parámetro en tiempo real.
  *
- * El campo 'data' del mensaje contiene el número de canal (0..47).
+ * El campo 'data' del mensaje contiene el número de canal (0..71).
  * El MAD responde con el valor actual de ese canal.
  */
 static void handle_read_param(uint16_t channel) {
@@ -84,7 +96,12 @@ static void handle_read_param(uint16_t channel) {
     return;
   }
 
-  int16_t value = s_channel_values[channel];
+  int16_t value;
+  if (channel < CMD_CH_ANA_DIG) {
+    value = s_channel_values[channel];
+  } else {
+    value = sample_format_get_param(s_cmd_ext[channel - CMD_CH_ANA_DIG]);
+  }
   send_response(CMD_READ_PARAM, (uint16_t)value);
 
   ESP_LOGD(TAG, "CMD1: Canal %d = %d", channel, value);
@@ -308,7 +325,7 @@ esp_err_t cmd_port_process(void) {
 }
 
 void cmd_port_update_channel(uint8_t channel, int16_t value) {
-  if (channel < MAX_CHANNELS) {
+  if (channel < CMD_CH_ANA_DIG) {
     s_channel_values[channel] = value;
   }
 }

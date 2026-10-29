@@ -7,14 +7,16 @@
 #include "sdmmc_cmd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
-
-
+#include "esp_rom_gpio.h"
+#include "soc/spi_periph.h"
 
 static const char *TAG = "SD_STORAGE";
 
@@ -24,24 +26,56 @@ static const char *TAG = "SD_STORAGE";
 static bool sd1_ok = false;
 static bool sd2_ok = false;
 
-#define WRITE_BUFFER_SIZE (16 * 1024)
 #define FREE_SPACE_THRESHOLD_BYTES (1024ULL * 1024ULL * 1024ULL)
 
 #define FILE_INDEX_MIN 1
 #define FILE_INDEX_MAX 9999
 
-static uint8_t s_write_buf[WRITE_BUFFER_SIZE];
-static size_t s_buf_pos = 0;
-
 static FILE *s_flight_file_1 = NULL;
 static FILE *s_flight_file_2 = NULL;
 
-static uint32_t s_flush_count = 0;
+static uint32_t s_consec_err_1 = 0;
+static uint32_t s_consec_err_2 = 0;
 
 static sdmmc_card_t *s_card_1 = NULL;
 static sdmmc_card_t *s_card_2 = NULL;
 
 static SemaphoreHandle_t s_sd_mutex = NULL;
+
+#ifdef PIN_SD_MISO2
+static int s_miso_sel = 0;
+
+static void init_miso_pads(void) {
+    gpio_config_t conf = {
+        .pin_bit_mask  = (1ULL << PIN_SD_MISO) | (1ULL << PIN_SD_MISO2),
+        .mode          = GPIO_MODE_INPUT,
+        .pull_up_en    = GPIO_PULLUP_ENABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&conf);
+}
+
+static void switch_miso_to_sd1(void) {
+    if (s_miso_sel == 1) return;
+    esp_rom_gpio_connect_in_signal(PIN_SD_MISO,
+                                   spi_periph_signal[SPI3_HOST].spiq_in,
+                                   false);
+    s_miso_sel = 1;
+}
+
+static void switch_miso_to_sd2(void) {
+    if (s_miso_sel == 2) return;
+    esp_rom_gpio_connect_in_signal(PIN_SD_MISO2,
+                                   spi_periph_signal[SPI3_HOST].spiq_in,
+                                   false);
+    s_miso_sel = 2;
+}
+#else
+#define init_miso_pads()     ((void)0)
+#define switch_miso_to_sd1() ((void)0)
+#define switch_miso_to_sd2() ((void)0)
+#endif
 
 static void scan_fdr_files_on_mount(const char* mount_point, bool exists[], int *count) {
   DIR *dir = opendir(mount_point);
@@ -114,30 +148,27 @@ esp_err_t sd_storage_init(void) {
   s_sd_mutex = xSemaphoreCreateMutex();
   if (s_sd_mutex == NULL) return ESP_FAIL;
 
-  spi_bus_config_t bus_cfg = {
-      .mosi_io_num = PIN_SD_MOSI,
-      .miso_io_num = PIN_SD_MISO,
-      .sclk_io_num = PIN_SD_CLK,
-      .quadwp_io_num = -1,
-      .quadhd_io_num = -1,
-      .max_transfer_sz = 16 * 1024,
-  };
-  
-    // Pull-ups para datos
-  // gpio_pullup_en(PIN_SD_MOSI);
-  // gpio_pullup_en(PIN_SD_MISO);
-  
   // DRIVING CS PINS HIGH BEFORE SPI INIT TO PREVENT BUS COLLISION!
-  // Los módulos de SD genéricos suelen tener pull-downs que le ganan al pull-up interno, 
-  // dejando el CS en LOW (activo). Si ambos módulos están activos, colisionan en el bus MISO (Error 0x108).
   gpio_set_direction(PIN_SD_CS1, GPIO_MODE_OUTPUT);
   gpio_set_level(PIN_SD_CS1, 1);
   
   gpio_set_direction(PIN_SD_CS2, GPIO_MODE_OUTPUT);
   gpio_set_level(PIN_SD_CS2, 1);
   
-  // Un pequeño delay para que las señales se asienten
   vTaskDelay(pdMS_TO_TICKS(10));
+
+#ifdef PIN_SD_MISO2
+  init_miso_pads();
+#endif
+
+  spi_bus_config_t bus_cfg = {
+      .mosi_io_num = PIN_SD_MOSI,
+      .miso_io_num = PIN_SD_MISO,
+      .sclk_io_num = PIN_SD_CLK,
+      .quadwp_io_num = -1,
+      .quadhd_io_num = -1,
+      .max_transfer_sz = 32 * 1024,
+  };
 
   esp_err_t ret = spi_bus_initialize(SPI3_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
   if (ret != ESP_OK) {
@@ -148,36 +179,43 @@ esp_err_t sd_storage_init(void) {
   esp_vfs_fat_sdmmc_mount_config_t mount_config = {
       .format_if_mount_failed = false,
       .max_files = 5,
-      .allocation_unit_size = 16 * 1024
+      .allocation_unit_size = 32 * 1024
   };
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
   host.slot = SPI3_HOST;
-  host.max_freq_khz = 20000;
-
+  host.max_freq_khz = 10000;          // 10 MHz para estabilidad e integridad de senal
+  host.command_timeout_ms = 15000;    // 15 s timeout para tolerar borrados NAND de FTL
 
   sdspi_device_config_t slot_config1 = SDSPI_DEVICE_CONFIG_DEFAULT();
   slot_config1.gpio_cs = PIN_SD_CS1;
   slot_config1.host_id = SPI3_HOST;
-  
 
-  if (esp_vfs_fat_sdspi_mount(MOUNT_POINT_1, &host, &slot_config1, &mount_config, &s_card_1) == ESP_OK) {
+  switch_miso_to_sd1();
+  esp_err_t m1 = esp_vfs_fat_sdspi_mount(MOUNT_POINT_1, &host, &slot_config1, &mount_config, &s_card_1);
+  if (m1 == ESP_OK) {
       sd1_ok = true;
       ESP_LOGI(TAG, "SD1 montada correctamente.");
   } else {
-      ESP_LOGW(TAG, "Fallo al montar SD1");
+      ESP_LOGW(TAG, "Fallo al montar SD1 (%s). "
+                    "SDXC de 32 GB+ suelen venir en exFAT; este firmware solo monta FAT32. "
+                    "Formateá la tarjeta en FAT32 (cluster 32 KB) e insertala de nuevo.",
+               esp_err_to_name(m1));
   }
 
   sdspi_device_config_t slot_config2 = SDSPI_DEVICE_CONFIG_DEFAULT();
   slot_config2.gpio_cs = PIN_SD_CS2;
   slot_config2.host_id = SPI3_HOST;
 
-
-  if (esp_vfs_fat_sdspi_mount(MOUNT_POINT_2, &host, &slot_config2, &mount_config, &s_card_2) == ESP_OK) {
+  switch_miso_to_sd2();
+  esp_err_t m2 = esp_vfs_fat_sdspi_mount(MOUNT_POINT_2, &host, &slot_config2, &mount_config, &s_card_2);
+  if (m2 == ESP_OK) {
       sd2_ok = true;
       ESP_LOGI(TAG, "SD2 montada correctamente.");
   } else {
-      ESP_LOGW(TAG, "Fallo al montar SD2");
+      ESP_LOGW(TAG, "Fallo al montar SD2 (%s). "
+                    "Si es SDXC nueva, formateala en FAT32 (cluster 32 KB, no exFAT).",
+               esp_err_to_name(m2));
   }
 
   if (sd1_ok || sd2_ok) return ESP_OK;
@@ -207,15 +245,11 @@ static esp_err_t ensure_free_space_on_mount(const char* mount_point, bool *sd_ok
 }
 
 esp_err_t sd_storage_ensure_free_space(void) {
-
   esp_err_t r1 = ensure_free_space_on_mount(MOUNT_POINT_1, &sd1_ok);
-
   esp_err_t r2 = ensure_free_space_on_mount(MOUNT_POINT_2, &sd2_ok);
   if (r1 == ESP_OK || r2 == ESP_OK) return ESP_OK;
   return ESP_FAIL;
 }
-
-static esp_err_t flush_buffer(void);
 
 static esp_err_t open_file_on_mount(const char* mount_point, bool *sd_ok_flag, FILE **file_ptr, uint8_t cev_format) {
   if (!*sd_ok_flag) return ESP_FAIL;
@@ -266,14 +300,15 @@ esp_err_t sd_storage_open_flight_file(uint8_t cev_format) {
   if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
 
   if (s_flight_file_1 != NULL || s_flight_file_2 != NULL) {
-    flush_buffer();
     if (s_flight_file_1) { 
-
+      switch_miso_to_sd1();
+      fflush(s_flight_file_1);
       int fd = fileno(s_flight_file_1); if (fd >= 0) fsync(fd); 
       fclose(s_flight_file_1); s_flight_file_1 = NULL; 
     }
     if (s_flight_file_2) { 
-
+      switch_miso_to_sd2();
+      fflush(s_flight_file_2);
       int fd = fileno(s_flight_file_2); if (fd >= 0) fsync(fd); 
       fclose(s_flight_file_2); s_flight_file_2 = NULL; 
     }
@@ -281,14 +316,22 @@ esp_err_t sd_storage_open_flight_file(uint8_t cev_format) {
 
   sd_storage_ensure_free_space();
 
-
+  switch_miso_to_sd1();
   esp_err_t r1 = open_file_on_mount(MOUNT_POINT_1, &sd1_ok, &s_flight_file_1, cev_format);
-  
+  if (s_flight_file_1 != NULL) {
+    fflush(s_flight_file_1);
+    fsync(fileno(s_flight_file_1));
+  }
 
+  switch_miso_to_sd2();
   esp_err_t r2 = open_file_on_mount(MOUNT_POINT_2, &sd2_ok, &s_flight_file_2, cev_format);
+  if (s_flight_file_2 != NULL) {
+    fflush(s_flight_file_2);
+    fsync(fileno(s_flight_file_2));
+  }
 
-  s_buf_pos = 0;
-  s_flush_count = 0;
+  s_consec_err_1 = 0;
+  s_consec_err_2 = 0;
 
   if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
   
@@ -296,117 +339,100 @@ esp_err_t sd_storage_open_flight_file(uint8_t cev_format) {
   return ESP_FAIL;
 }
 
-static esp_err_t flush_buffer(void) {
-  if (s_buf_pos == 0) return ESP_OK;
+esp_err_t sd_storage_write_dual(const void *data, size_t size) {
+    if (s_flight_file_1 == NULL && s_flight_file_2 == NULL) return ESP_ERR_INVALID_STATE;
+    if (data == NULL || size == 0) return ESP_ERR_INVALID_ARG;
 
-  esp_err_t ret = ESP_FAIL;
+    if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
 
-  if (s_flight_file_1 != NULL) {
+    bool any_ok = false;
 
-    size_t written = fwrite(s_write_buf, 1, s_buf_pos, s_flight_file_1);
-    if (written != s_buf_pos) {
-      ESP_LOGE(TAG, "Error escritura SD1");
-      fclose(s_flight_file_1); s_flight_file_1 = NULL; sd1_ok = false;
-    } else {
-      ret = ESP_OK;
+    if (s_flight_file_1 != NULL) {
+        switch_miso_to_sd1();
+        size_t written = fwrite(data, 1, size, s_flight_file_1);
+        if (written != size) {
+            s_consec_err_1++;
+            ESP_LOGE(TAG, "Error de escritura en SD1 (%d/%d) [#%lu]",
+                     (int)written, (int)size, (unsigned long)s_consec_err_1);
+            gpio_set_level(PIN_SD_CS1, 1);
+            clearerr(s_flight_file_1);
+            if (s_consec_err_1 >= 3) {
+                ESP_LOGE(TAG, "SD1 deshabilitada tras 3 fallos consecutivos. Continuando en SD2...");
+                fclose(s_flight_file_1);
+                s_flight_file_1 = NULL;
+                sd1_ok = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } else {
+            s_consec_err_1 = 0;
+            any_ok = true;
+        }
     }
-  }
 
-  if (s_flight_file_2 != NULL) {
-
-    size_t written = fwrite(s_write_buf, 1, s_buf_pos, s_flight_file_2);
-    if (written != s_buf_pos) {
-      ESP_LOGE(TAG, "Error escritura SD2");
-      fclose(s_flight_file_2); s_flight_file_2 = NULL; sd2_ok = false;
-    } else {
-      ret = ESP_OK;
+    if (s_flight_file_2 != NULL) {
+        switch_miso_to_sd2();
+        size_t written = fwrite(data, 1, size, s_flight_file_2);
+        if (written != size) {
+            s_consec_err_2++;
+            ESP_LOGE(TAG, "Error de escritura en SD2 (%d/%d) [#%lu]",
+                     (int)written, (int)size, (unsigned long)s_consec_err_2);
+            gpio_set_level(PIN_SD_CS2, 1);
+            clearerr(s_flight_file_2);
+            if (s_consec_err_2 >= 3) {
+                ESP_LOGE(TAG, "SD2 deshabilitada tras 3 fallos consecutivos. Continuando en SD1...");
+                fclose(s_flight_file_2);
+                s_flight_file_2 = NULL;
+                sd2_ok = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } else {
+            s_consec_err_2 = 0;
+            any_ok = true;
+        }
     }
-  }
 
-  s_buf_pos = 0;
-  s_flush_count++;
-
-  return ret;
+    if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
+    return any_ok ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t sd_storage_write(const void *data, size_t length) {
-  if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
-
-  if (s_flight_file_1 == NULL && s_flight_file_2 == NULL) {
-    if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
-    return ESP_ERR_INVALID_STATE;
-  }
-  if (data == NULL || length == 0) {
-    if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  const uint8_t *src = (const uint8_t *)data;
-  size_t remaining = length;
-
-  while (remaining > 0) {
-    size_t space = WRITE_BUFFER_SIZE - s_buf_pos;
-    size_t to_copy = (remaining < space) ? remaining : space;
-
-    memcpy(s_write_buf + s_buf_pos, src, to_copy);
-    s_buf_pos += to_copy;
-    src += to_copy;
-    remaining -= to_copy;
-
-    if (s_buf_pos >= WRITE_BUFFER_SIZE) {
-      esp_err_t ret = flush_buffer();
-      if (ret != ESP_OK) {
-        if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
-        return ret;
-      }
-    }
-  }
-
-  if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
-  return ESP_OK;
-}
-
-esp_err_t sd_storage_flush(void) {
-  if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
-
-  esp_err_t ret = flush_buffer();
-
-  if (s_flight_file_1 != NULL) {
-    fflush(s_flight_file_1);
-    int fd = fileno(s_flight_file_1);
-    if (fd >= 0) fsync(fd);
-  }
-  if (s_flight_file_2 != NULL) {
-    fflush(s_flight_file_2);
-    int fd = fileno(s_flight_file_2);
-    if (fd >= 0) fsync(fd);
-  }
-
-  if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
-  return ret;
-}
-
-static esp_err_t flush_one(FILE *file) {
-  if (file == NULL) return ESP_ERR_INVALID_STATE;
-  flush_buffer();
-  fflush(file);
-  int fd = fileno(file);
-  if (fd >= 0) fsync(fd);
-  return ESP_OK;
+    return sd_storage_write_dual(data, length);
 }
 
 esp_err_t sd_storage_flush_1(void) {
-  if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
-  esp_err_t ret = flush_one(s_flight_file_1);
-  if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
-  return ret;
+    if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
+    if (s_flight_file_1 != NULL) {
+        switch_miso_to_sd1();
+        int64_t t0 = esp_timer_get_time();
+        fflush(s_flight_file_1);
+        int fd = fileno(s_flight_file_1);
+        if (fd >= 0) fsync(fd);
+        uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+        ESP_LOGI(TAG, "fsync SD1 tardó %lu us", (unsigned long)us);
+    }
+    if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
+    return ESP_OK;
 }
 
 esp_err_t sd_storage_flush_2(void) {
-  if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
-  esp_err_t ret = flush_one(s_flight_file_2);
-  if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
-  return ret;
+    if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
+    if (s_flight_file_2 != NULL) {
+        switch_miso_to_sd2();
+        int64_t t0 = esp_timer_get_time();
+        fflush(s_flight_file_2);
+        int fd = fileno(s_flight_file_2);
+        if (fd >= 0) fsync(fd);
+        uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+        ESP_LOGI(TAG, "fsync SD2 tardó %lu us", (unsigned long)us);
+    }
+    if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
+    return ESP_OK;
+}
+
+esp_err_t sd_storage_flush(void) {
+    sd_storage_flush_1();
+    sd_storage_flush_2();
+    return ESP_OK;
 }
 
 esp_err_t sd_storage_write_error_log(const char *msg) {
@@ -445,24 +471,23 @@ esp_err_t sd_storage_write_error_log(const char *msg) {
 void sd_storage_close(void) {
   if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
 
-  flush_buffer();
   if (s_flight_file_1 != NULL) {
-
+    switch_miso_to_sd1();
+    fflush(s_flight_file_1);
     int fd = fileno(s_flight_file_1); if (fd >= 0) fsync(fd);
     fclose(s_flight_file_1); s_flight_file_1 = NULL;
   }
   if (s_flight_file_2 != NULL) {
-
+    switch_miso_to_sd2();
+    fflush(s_flight_file_2);
     int fd = fileno(s_flight_file_2); if (fd >= 0) fsync(fd);
     fclose(s_flight_file_2); s_flight_file_2 = NULL;
   }
 
   if (s_card_1 != NULL) { 
-
       esp_vfs_fat_sdcard_unmount(MOUNT_POINT_1, s_card_1); s_card_1 = NULL; 
   }
   if (s_card_2 != NULL) { 
-
       esp_vfs_fat_sdcard_unmount(MOUNT_POINT_2, s_card_2); s_card_2 = NULL; 
   }
 
@@ -472,7 +497,6 @@ void sd_storage_close(void) {
 esp_err_t sd_storage_format(void) {
   if (s_sd_mutex) xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
 
-  flush_buffer();
   if (s_flight_file_1 != NULL) {
     int fd = fileno(s_flight_file_1); if (fd >= 0) fsync(fd);
     fclose(s_flight_file_1); s_flight_file_1 = NULL;
@@ -483,8 +507,14 @@ esp_err_t sd_storage_format(void) {
   }
 
   esp_err_t r1 = ESP_OK, r2 = ESP_OK;
-  if (s_card_1) r1 = esp_vfs_fat_sdcard_format(MOUNT_POINT_1, s_card_1);
-  if (s_card_2) r2 = esp_vfs_fat_sdcard_format(MOUNT_POINT_2, s_card_2);
+  if (s_card_1) {
+    switch_miso_to_sd1();
+    r1 = esp_vfs_fat_sdcard_format(MOUNT_POINT_1, s_card_1);
+  }
+  if (s_card_2) {
+    switch_miso_to_sd2();
+    r2 = esp_vfs_fat_sdcard_format(MOUNT_POINT_2, s_card_2);
+  }
 
   if (s_sd_mutex) xSemaphoreGive(s_sd_mutex);
   return (r1 == ESP_OK && r2 == ESP_OK) ? ESP_OK : ESP_FAIL;

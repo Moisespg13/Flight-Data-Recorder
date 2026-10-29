@@ -115,6 +115,9 @@ int sample_format_get_tick_period_ms(void);
 /** @brief Devuelve cuántos frames ensamblar por tick (3 para F1/F2, 1 para F3). */
 int sample_format_get_frames_per_tick(void);
 
+/** @brief Último valor crudo (int16) de un parámetro CEV. */
+int16_t sample_format_get_param(cev_param_id_t id);
+
 // --- Funciones de actualización (llamadas por las tareas de adquisición) ---
 
 /** @brief Actualiza canales rápidos ANA 1-16 (desde el Esclavo). */

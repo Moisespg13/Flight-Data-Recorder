@@ -70,9 +70,9 @@ typedef struct {
   uint32_t drdy_stale;    // Flancos cuyo dato ya no estaba en oferta
   uint32_t dup_fast;      // Paquetes rápidos repetidos (misma secuencia)
   uint32_t dup_slow;      // Paquetes lentos repetidos (misma secuencia)
-  uint32_t lost_fast;     // Paquetes rápidos perdidos (salto de secuencia)
+  uint32_t lost_fast;     // Muestras rápidas perdidas (salto de seq × N/pkt)
   uint32_t lost_slow;     // Paquetes lentos perdidos (salto de secuencia)
-  uint32_t drop_fast;     // Paquetes rápidos descartados por cola llena
+  uint32_t drop_fast;     // Muestras rápidas descartadas por cola llena
   uint32_t drop_slow;     // Paquetes lentos descartados por cola llena
 } link_stats_t;
 
@@ -85,7 +85,8 @@ static bool s_seq_fast_init = false;
 static bool s_seq_slow_init = false;
 
 // Throughput
-static uint32_t s_tp_fast_count = 0;
+static uint32_t s_tp_fast_pkt_count = 0;
+static uint32_t s_tp_fast_sample_count = 0;
 static int64_t s_tp_last_us = 0;
 
 /**
@@ -189,10 +190,12 @@ static void dispatch_packet(const fdr_header_t *hdr, const uint8_t *payload) {
       for (int i = 0; i < FAST_SAMPLES_PER_SPI_PKT; i++) {
         if (xQueueSend(s_fast_queue, &batch->samples[i], 0) != pdPASS) {
           s_stats.drop_fast++;
+        } else {
+          s_tp_fast_sample_count++;
         }
       }
     }
-    s_tp_fast_count++;
+    s_tp_fast_pkt_count++;
     break;
 
   case PKT_TYPE_SLOW_DATA:
@@ -343,13 +346,16 @@ static void tsk_spi_link_master(void *pvParameters) {
     int64_t now_us = esp_timer_get_time();
     if (s_tp_last_us == 0) s_tp_last_us = now_us;
     if (now_us - s_tp_last_us >= 5000000) {
-      float rate = (float)s_tp_fast_count /
-                   ((float)(now_us - s_tp_last_us) / 1000000.0f);
+      float dt = (float)(now_us - s_tp_last_us) / 1000000.0f;
+      float pkt_rate = (float)s_tp_fast_pkt_count / dt;
+      float sample_rate = (float)s_tp_fast_sample_count / dt;
       ESP_LOGI(TAG,
-               "THROUGHPUT: %.0f fast pkt/s | tx=%lu ok=%lu bad=%lu | "
+               "THROUGHPUT: %.0f fast pkt/s (%.0f samples/s, %dx/pkt) | "
+               "tx=%lu ok=%lu bad=%lu | "
                "perdidos f=%lu s=%lu | repetidos f=%lu s=%lu | "
                "descartados f=%lu s=%lu | drdy_to=%lu drdy_stale=%lu",
-               rate, (unsigned long)s_stats.tx_total,
+               pkt_rate, sample_rate, FAST_SAMPLES_PER_SPI_PKT,
+               (unsigned long)s_stats.tx_total,
                (unsigned long)s_stats.pkt_ok, (unsigned long)s_stats.pkt_bad,
                (unsigned long)s_stats.lost_fast,
                (unsigned long)s_stats.lost_slow,
@@ -359,7 +365,8 @@ static void tsk_spi_link_master(void *pvParameters) {
                (unsigned long)s_stats.drop_slow,
                (unsigned long)s_stats.drdy_timeouts,
                (unsigned long)s_stats.drdy_stale);
-      s_tp_fast_count = 0;
+      s_tp_fast_pkt_count = 0;
+      s_tp_fast_sample_count = 0;
       s_tp_last_us = now_us;
     }
   }

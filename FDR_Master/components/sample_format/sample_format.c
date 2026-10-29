@@ -189,6 +189,13 @@ int sample_format_get_frames_per_tick(void) {
   return (s_active_format == CEV_FORMAT_3) ? 1 : 3;
 }
 
+int16_t sample_format_get_param(cev_param_id_t id) {
+  if (id >= PARAM_COUNT) {
+    return 0;
+  }
+  return s_params[id];
+}
+
 // --- Actualización de parámetros ---
 
 void sample_format_update_fast(const int16_t channels[16]) {

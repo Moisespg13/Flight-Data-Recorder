@@ -36,7 +36,7 @@
 static const char *TAG = "USB_TRANSFER";
 
 // Rutas de montaje
-#define SD_MOUNT_POINT  "/sdcard"
+#define SD_MOUNT_POINT  "/sd1"
 #define USB_MOUNT_POINT "/usb"
 
 // Buffer para copia de archivos (8 KB)

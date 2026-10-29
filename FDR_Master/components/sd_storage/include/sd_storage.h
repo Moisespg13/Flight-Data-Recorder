@@ -54,6 +54,12 @@ esp_err_t sd_storage_open_flight_file(uint8_t cev_format);
 esp_err_t sd_storage_write(const void *data, size_t length);
 
 /**
+ * @brief Escribe directamente un bloque de datos en ambas MicroSD.
+ * Bloques atómicos de 32 KB alineados al cluster FAT32.
+ */
+esp_err_t sd_storage_write_dual(const void *data, size_t size);
+
+/**
  * @brief Fuerza la escritura de los datos pendientes en el buffer a disco.
  *
  * Llama a fwrite + fsync para garantizar que los datos lleguen

@@ -9,7 +9,7 @@
  * Flujo de operación:
  *   1. Técnico enchufa un pendrive al conector USB del MAD.
  *   2. El sistema detecta la inserción y monta el pendrive.
- *   3. Copia todos los archivos .bin de /sdcard a /usb.
+ *   3. Copia todos los archivos .bin de /sd1 a /usb.
  *   4. Desmonta el pendrive y señaliza que la descarga terminó.
  *
  * NOTA: Esta funcionalidad solo se activa en MODO DESCARGA.
@@ -43,7 +43,7 @@ esp_err_t usb_transfer_init(void);
 /**
  * @brief Copia todos los archivos de vuelo de la SD al pendrive.
  *
- * Recorre /sdcard buscando archivos FDR_XXXX.bin y los copia
+ * Recorre /sd1 buscando archivos FDR_XXXX.bin y los copia
  * al pendrive montado en /usb. Muestra progreso por log.
  *
  * @return ESP_OK si la copia fue exitosa.

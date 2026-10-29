@@ -1,4 +1,4 @@
-﻿{
+{
     "idf.flashType": "UART",
     "idf.portWin": "COM3",
     "idf.currentSetup": "C:/Esp32IDF/Espressif/frameworks/esp-idf-v5.5.1/",
@@ -23,6 +23,6 @@
     ],
     "python.analysis.extraPaths": [
         ".vscode\\Pico-W-Stub"
-    ]
+    ],
+    "idf.port": "COM3"
 }
-
