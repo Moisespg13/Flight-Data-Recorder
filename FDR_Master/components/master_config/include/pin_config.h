@@ -19,7 +19,7 @@
 #define PIN_SPI_DRDY 11
 
 // ============================================================================
-// I2C EXPANSOR DISCRETO (TCA9555)
+// I2C EXPANSOR DISCRETO (TCA9555) Y RTC (DS3232)
 // ============================================================================
 #define PIN_I2C_SCL 4
 #define PIN_I2C_SDA 5

@@ -10,7 +10,7 @@ El detalle completo de arquitectura, pines, protocolo y formatos se encuentra do
 
 El registrador opera mediante una arquitectura distribuida de dos microcontroladores concurrentes bajo FreeRTOS:
 
-- **Placa Maestra (ESP32-S3)**: Programada sobre el framework ESP-IDF (v5.5). Recibe las tramas de adquisición del esclavo vía SPI, sincroniza el tiempo absoluto con el receptor GNSS (UART2 + PPS), captura datos inerciales de la IMU Xsens MTi (UART0) y 16 señales discretas desde un expansor I2C **TCA9555** a 400 kHz. Ensambla las tramas según los estándares CEV (Formatos 1, 2 o 3) y las almacena con redundancia en dos tarjetas MicroSD (SPI3) mediante un búfer anular de 6 MB alojado en memoria PSRAM octal.
+- **Placa Maestra (ESP32-S3)**: Programada sobre el framework ESP-IDF (v5.5). Recibe las tramas de adquisición del esclavo vía SPI, sincroniza el tiempo absoluto con el receptor GNSS (UART2 + PPS) y el RTC externo DS3232 (I2C en 0x68), captura datos inerciales de la IMU Xsens MTi (UART0) y 16 señales discretas desde un expansor I2C **TCA9555** a 400 kHz. Ensambla las tramas según los estándares CEV (Formatos 1, 2 o 3) y las almacena con redundancia en dos tarjetas MicroSD (SPI3) mediante un búfer anular de 6 MB alojado en memoria PSRAM octal.
 - **Placa Esclava (RP2040-Zero)**: Programada con Raspberry Pi Pico SDK 2.2 y FreeRTOS SMP. Muestrea 16 canales analógicos rápidos a 3 kHz mediante 2× AD7606 (16 bits, muestreo simultáneo) y 16 canales lentos a ~20 Hz con 1× AD7490 (12 bits) sobre el bus SPI0. Transmite los datos al maestro mediante un esclavo SPI implementado en las máquinas de estados programables (**PIO**) del RP2040 con soporte DMA, eliminando los problemas de corrimiento de bits del controlador SPI por hardware integrado.
 
 ### Sincronización y Modos de Operación
@@ -29,7 +29,7 @@ El registrador opera mediante una arquitectura distribuida de dos microcontrolad
 - **Formateo con Clústeres de 32 KB y Búfer de Escritura Alineado**: Las tarjetas MicroSD se formatean en FAT32 con clústeres de 32 KB, y el búfer de volcado de la tarea escritora se configuró a 32 KB para coincidir exactamente con el tamaño de clúster. Esto minimiza las actualizaciones parciales de la FAT y optimiza la velocidad de escritura de las tarjetas.
 - **Tolerancia a Fallos y Aislamiento Automático de MicroSD**: Si una de las dos tarjetas MicroSD presenta una falla de bus, bloqueo o error de escritura (`fwrite`), el controlador dual la desactiva automáticamente y continúa registrando sin interrupciones en la tarjeta operativa restante.
 - **Cadencia de Sincronización (`fsync`) Desfasada**: El vaciado de metadatos al disco se realiza de manera periódica pero alternada en el tiempo (SD1 a los 5 minutos, SD2 a los 7,5 minutos), evitando que ambas tarjetas bloqueen simultáneamente el bus SPI3 compartido.
-- **Validación Prolongada de más de 3 Horas**: Sistema validado con ensayos ininterrumpidos de más de 3 horas en el banco de pruebas con señales en rampa simuladas, verificando la ausencia total de pérdidas de muestras (*0 drops*) y la integridad estructural de los datos.
+- **Validación Prolongada de más de 3 Horas**: Sistema validado con ensayos ininterrumpidos de más de 3 horas en el testbench con señales en rampa simuladas, verificando la ausencia total de pérdidas de muestras (*0 drops*) y la integridad estructural de los datos.
 - **FDR Converter con FFT, LOD Dinámico y Ejecutable**:
   - Incorporación de análisis en frecuencia mediante **FFT** para visualización espectral y detección armónica.
   - Implementación de **Nivel de Detalle Dinámico (LOD)**: sub-muestreo inteligente para la renderización gráfica que ajusta los puntos dibujados en tiempo real según el nivel de zoom, permitiendo explorar grabaciones masivas (más de 1 h o 3 h con millones de muestras) con total fluidez y bajo consumo de memoria RAM.
@@ -48,7 +48,7 @@ El registrador opera mediante una arquitectura distribuida de dos microcontrolad
 | Receptor GNSS (NMEA + PPS) | UART2 (9600 baud) + GPIO | RX 17, TX 16, PPS 15 *(2)* |
 | IMU Xsens MTi | UART0 (115200 baud) | RX 44, TX 43 |
 | Puerto de Comandos | UART1 (115200 baud, MAX3232) | RX 41, TX 42 |
-| Expansor 16 Discretas | I2C (400 kHz, TCA9555 `0x20`) | SCL 4, SDA 5 |
+| Expansor 16 Discretas y RTC | I2C (400 kHz, TCA9555 `0x20`, DS3232 `0x68`) | SCL 4, SDA 5 |
 | Detección de Power-Loss | GPIO (flanco de bajada) | GPIO 46 |
 | LED de Estado | GPIO | GPIO 0 |
 | Descarga USB Host | USB OTG nativo (MSC) | D- GPIO 19, D+ GPIO 20 |
@@ -96,7 +96,7 @@ FDR/
 ├── FDR_Common/          # protocol.h, crc_utils.h (estructuras de paquetes y CRC32)
 ├── FDR_Master/          # Firmware ESP32-S3 (ESP-IDF v5.5)
 │   ├── components/      # master_logic, spi_link, sd_storage, sample_format,
-│   │                    # gnss, imu_xsens, discrete_signals, cmd_port,
+│   │                    # gnss, rtc_ds3232, imu_xsens, discrete_signals, cmd_port,
 │   │                    # supervisor, usb_transfer, master_config
 │   └── main/            # Punto de entrada de la aplicación
 ├── FDR_Slave/           # Firmware RP2040-Zero (Pico SDK 2.2 + FreeRTOS SMP)
